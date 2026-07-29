@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Geodatabases, connection files, and lock files never belong in a repo
+*.gdb/
+*.sde
+*.lock
+
+# Logs
+logs/
+*.log
+
+# Credentials
+.env
+*.env
+credentials*
+*token*
