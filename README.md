@@ -158,3 +158,10 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT.
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [safe-republish](https://github.com/uhsear/safe-republish) - the refusal that should sit in front of a truncate and append
+- [gdbxray](https://github.com/uhsear/gdbxray) - what the destination geodatabase actually holds, subtypes and attribute rules included
