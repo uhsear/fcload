@@ -36,7 +36,8 @@ REFUSALS (fcload stops instead of importing)
    An UNDEFINED target is refused too: a `check --target` shapefile, or for import the
    feature dataset or existing feature class the rows land in. There is no override.
 2. Projected source spatial reference whose extent lies entirely inside degree bounds
-   (|x| <= 180, |y| <= 90). The .prj is wrong; the coordinates are lat/long.
+   (|x| <= 180, |y| <= 90, plus 1e-9 for rounding). The .prj is wrong; the coordinates
+   are lat/long.
 3. Geographic source spatial reference whose extent falls outside degree bounds.
    The .prj is wrong; the coordinates are projected units.
 4. Row count after the load does not match the row count expected. The load is
@@ -46,10 +47,12 @@ REFUSALS (fcload stops instead of importing)
 6. A source that holds no features. Its extent says nothing about where data is.
 7. `check` only: a .shp, .prj or .dbf header that is corrupt or truncated (a .prj
    whose WKT is not well formed, or not on one line, or lacks a node Pro needs, see
-   parse_prj; a .dbf that repeats a field name in another case, or whose record count
-   does not fit its file size), and a target whose own .prj contradicts its bounding
-   box (refusals 2 and 3 applied to the target). Also a .shp, .prj or .dbf that is a
-   link. A .prj that is not WKT is refused without echoing its text.
+   parse_prj; a .dbf that repeats a field name in another case, whose record length is
+   not its fields' total, or whose record count does not fit its file size), and a
+   target whose own .prj contradicts its bounding box (refusals 2 and 3 applied to the
+   target). Also a .shp, .prj or .dbf that is a symbolic or hard link. A .prj that is
+   not WKT is refused without echoing its text, and a header error names bytes, not
+   their values.
 
 VERSIONING (ERROR 001332)
 -------------------------
@@ -95,6 +98,9 @@ REFUSE = "REFUSE"
 # degrees; a pair outside it is almost certainly projected units.
 DEGREE_X = 180.0
 DEGREE_Y = 90.0
+# Floating-point slack on those bounds. A full-world extent converted from Web Mercator
+# reaches 180.00000000000003, one ULP past 180; 1e-9 degrees is about 0.1 mm on the ground.
+DEGREE_SLACK = 1e-9
 
 # Names arcpy manages itself. Diffing or adding these is never the user's job.
 SYSTEM_FIELDS = frozenset(
@@ -259,10 +265,10 @@ def extent_in_degree_range(extent):
     if not all(map(math.isfinite, (xmin, ymin, xmax, ymax))):
         return None
     return (
-        abs(xmin) <= DEGREE_X
-        and abs(xmax) <= DEGREE_X
-        and abs(ymin) <= DEGREE_Y
-        and abs(ymax) <= DEGREE_Y
+        abs(xmin) <= DEGREE_X + DEGREE_SLACK
+        and abs(xmax) <= DEGREE_X + DEGREE_SLACK
+        and abs(ymin) <= DEGREE_Y + DEGREE_SLACK
+        and abs(ymax) <= DEGREE_Y + DEGREE_SLACK
     )
 
 
@@ -271,7 +277,7 @@ def _wkid_text(code):
     return "WKID %d" % code if code else "no WKID stated"
 
 
-def sr_undefined(code, name, prj_defined=False):
+def sr_undefined(code, name, prj_defined):
     """True when a spatial reference is UNDEFINED. One rule for a source and a target.
 
     factoryCode 0 is undefined unless a .prj names a WKT root (prj_defined); a name such
@@ -524,27 +530,25 @@ def parse_shp_header(head, size):
     if len(head) < SHP_HEADER:
         raise ValueError("the .shp is %d bytes; its header alone is %d"
                          % (len(head), SHP_HEADER))
-    code = struct.unpack(">i", head[0:4])[0]
-    if code != SHP_FILE_CODE:
-        raise ValueError("the .shp file code at byte 0 is %d, not %d (big-endian): "
-                         "this is not a shapefile" % (code, SHP_FILE_CODE))
+    # The messages below name the bytes, never their values: a file that is not a
+    # shapefile, such as a secret under a .shp name, must not reach the log.
+    if struct.unpack(">i", head[0:4])[0] != SHP_FILE_CODE:
+        raise ValueError("the .shp file code at byte 0 is not %d (big-endian): "
+                         "this is not a shapefile" % SHP_FILE_CODE)
     length = struct.unpack(">i", head[24:28])[0] * 2
     version, shape_type = struct.unpack("<2i", head[28:36])
     if version != SHP_VERSION:
-        raise ValueError("the .shp version at byte 28 is %d, not %d (little-endian)"
-                         % (version, SHP_VERSION))
+        raise ValueError("the .shp version at byte 28 is not %d (little-endian)" % SHP_VERSION)
     if shape_type not in SHAPE_TYPES:
-        raise ValueError("the .shp shape type at byte 32 is %d, which no shapefile uses"
-                         % shape_type)
+        raise ValueError("the .shp shape type at byte 32 is one that no shapefile uses")
     if length < SHP_HEADER or length > size:
-        raise ValueError("the .shp header declares %d bytes but the file holds %d: "
-                         "truncated or corrupt" % (length, size))
+        raise ValueError("the .shp file length at byte 24 is under %d bytes or over the %d "
+                         "the file holds: truncated or corrupt" % (SHP_HEADER, size))
     bbox = struct.unpack("<4d", head[36:68])
     empty = length == SHP_HEADER
     if not empty and not (all(map(math.isfinite, bbox))
                           and bbox[0] <= bbox[2] and bbox[1] <= bbox[3]):
-        raise ValueError("the .shp bounding box %s (bytes 36-67) is not a real extent"
-                         % (bbox,))
+        raise ValueError("the .shp bounding box (bytes 36-67) is not a real extent")
     return shape_type, bbox, empty
 
 
@@ -648,9 +652,11 @@ def _prj_datum(node):
     datum = _prj_one(node, "DATUM")
     _prj_named(datum)
     a, invf = _prj_named(_prj_one(datum, "SPHEROID"), 2)[1]
-    if a <= 0 or invf < 0:
-        raise _prj_fail("SPHEROID needs a positive semi-major axis and a non-negative "
-                        "inverse flattening")
+    # Measured on Pro 3.6: an inverse flattening of 0 (a sphere), 1 or 1.0001 is read, and
+    # 0.001, 0.5, 0.99 or 0.9999 is 'Unknown'. Below 1 the minor axis would be negative.
+    if a <= 0 or not (invf == 0 or invf >= 1):
+        raise _prj_fail("SPHEROID needs a positive semi-major axis and an inverse "
+                        "flattening of 0 or at least 1")
 
 
 def _prj_geogcs(g):
@@ -709,6 +715,28 @@ def _prj_vertcs(v):
     _prj_unit(v)
 
 
+def _prj_authorities(nodes):
+    """Refuse an AUTHORITY that is not one name and one code, anywhere in the tree.
+
+    Measured on Pro 3.6: AUTHORITY["EPSG"], AUTHORITY[4326], AUTHORITY["EPSG",""] or
+    AUTHORITY["  ","4326"], on the root or inside a DATUM, SPHEROID, UNIT, PROJECTION or
+    PARAMETER, and two AUTHORITY nodes in one node, each make the whole .prj 'Unknown'.
+    Pro also read a few forms that are refused here, such as AUTHORITY[EPSG,4326].
+    """
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        auths = _prj_nodes(node, "AUTHORITY")
+        if len(auths) > 1:
+            raise _prj_fail("%s has more than one AUTHORITY" % node[0])
+        for auth in auths:
+            org, code = auth[1] if len(auth[1]) == 2 else ("", "")
+            if not (isinstance(org, str) and org.strip() and (
+                    isinstance(code, float) or isinstance(code, str) and code.strip())):
+                raise _prj_fail("an AUTHORITY in %s is not one name and one code" % node[0])
+        stack.extend(c for c in node[1] if _is_node(c))
+
+
 def parse_prj(text):
     """Read what sr_verdict needs from .prj text. Pure.
 
@@ -752,18 +780,13 @@ def parse_prj(text):
     name = _prj_projcs(root) if root_kw == "PROJCS" else _prj_geogcs(root)
     if len(nodes) == 2:
         _prj_vertcs(nodes[1])
-    auths = _prj_nodes(root, "AUTHORITY")
-    if len(auths) > 1:
-        # Measured: Pro 3.6 reads a root with two AUTHORITY nodes as 'Unknown', same code or not.
-        raise _prj_fail("its root has more than one AUTHORITY")
+    _prj_authorities(nodes)
     wkid = 0
-    for auth in auths:
-        items = auth[1] + [None]
-        code = items[1]
+    for auth in _prj_nodes(root, "AUTHORITY"):          # at most one, checked above
+        org, code = auth[1]
         if isinstance(code, float) and code.is_integer():
             code = "%.0f" % code
-        if str(items[0]).upper() in ("EPSG", "ESRI") and isinstance(code, str) \
-                and code.isdecimal():
+        if org.upper() in ("EPSG", "ESRI") and isinstance(code, str) and code.isdecimal():
             wkid = int(code)
     kind = "Projected" if root_kw == "PROJCS" else "Geographic"
     return wkid, kind, name, True
@@ -784,9 +807,12 @@ def parse_dbf_fields(data, size):
     too short, has no 0x0D terminator inside its declared length, has a field with
     no name, or repeats a name case-insensitively. ArcGIS field names are unique
     without regard to case, and field_diff would silently keep only the last one.
-    Also raises when the header length plus record count times record length is not
-    the file size, give or take the 0x1A end byte. Measured on Pro 3.6: GetCount on a
-    .dbf whose count was patched to 0, 2 or 5 over 3 records fails, ERROR 000229.
+    Also raises when the record length is not 1 plus the sum of the field lengths
+    (byte 16 of each descriptor), or when the header length plus record count times
+    record length is not the file size, give or take the 0x1A end byte. Measured on Pro
+    3.6: GetCount on a .dbf whose count was patched to 0, 2 or 5 over 3 records fails,
+    ERROR 000229. A record length of 0 fits any count, so both rules are needed.
+    The messages name the header bytes, never their values (see parse_shp_header).
     """
     if len(data) < 32:
         raise ValueError("the .dbf is %d bytes; its header alone is at least 32"
@@ -794,11 +820,12 @@ def parse_dbf_fields(data, size):
     count, header_len, record_len = struct.unpack("<IHH", data[4:12])
     end = min(header_len, len(data))
     fields = []
+    width = 1                                   # the deletion flag byte
     pos = 32
     while data[pos:pos + 1] != b"\r" or pos >= end:
         if pos + 32 > end:
-            raise ValueError("the .dbf has no field terminator (0x0D) inside its "
-                             "%d-byte header" % header_len)
+            raise ValueError("the .dbf has no field terminator (0x0D) inside the header "
+                             "length that bytes 8-9 declare")
         desc = data[pos:pos + 32]
         # A byte above 0x7F stays a \xNN escape. The .cpg is not read, so the letter case
         # of such a byte is unknown, and lower() on a Latin-1 guess merges distinct names.
@@ -809,11 +836,16 @@ def parse_dbf_fields(data, size):
             raise ValueError("the .dbf names the field %r twice (field names are "
                              "unique without regard to case)" % name)
         fields.append((name, _dbf_type(desc[11:12].decode("latin-1"), desc[17])))
+        width += desc[16]
         pos += 32
+    # ponytail: byte 17 is not read as a high length byte for text fields over 255 bytes,
+    # which shapelib writes but no longer reads. Such a .dbf is refused, not guessed.
+    if record_len != width:
+        raise ValueError("the .dbf record length at bytes 10-11 is not 1 plus the sum of "
+                         "its field lengths: truncated or corrupt")
     if size - header_len - count * record_len not in (0, 1):
-        raise ValueError("the .dbf header declares %d records of %d bytes after %d bytes of "
-                         "header, but the file holds %d bytes: truncated or corrupt"
-                         % (count, record_len, header_len, size))
+        raise ValueError("the .dbf record count and lengths at bytes 4-11 do not fit the "
+                         "%d bytes the file holds: truncated or corrupt" % size)
     return count, fields
 
 
@@ -921,14 +953,15 @@ def read_shapefile(path, label):
         raise SystemExit("%s not found or not a .shp file: %s" % (label, path))
     prj = _sibling(base, ".prj")
     dbf = _sibling(base, ".dbf")
-    # unzip restores a symbolic link from an archive. A linked .shp, .prj or .dbf is not
-    # read, wherever it points: `parcels.dbf -> .token` in the same folder would print
-    # parts of the token as field names. Any link is refused, not only one leaving the folder.
-    for f in (path, prj, dbf):
-        if f and os.path.islink(f):
-            raise ValueError("%s %s: %s is a link, so it is not read: it could point at any "
-                             "file, such as ~/.pgpass" % (label, path, os.path.basename(f)))
     try:
+        # unzip restores a symbolic link from an archive, and tar a hard link to a file
+        # already in the folder. A linked .shp, .prj or .dbf is not read, wherever it
+        # points: `parcels.dbf -> .token` in the same folder would print parts of the token.
+        # A hard link is a second name with st_nlink > 1; os.link needs no admin on Windows.
+        for f in (path, prj, dbf):
+            if f and (os.path.islink(f) or os.stat(f).st_nlink > 1):
+                raise ValueError("%s is a link, so it is not read: it could point at any "
+                                 "file, such as ~/.pgpass" % os.path.basename(f))
         shape_type, bbox, empty = parse_shp_header(_read(path, SHP_HEADER),
                                                    os.path.getsize(path))
         prj_text = _read(prj, 65536).decode("utf-8", "replace") if prj else ""
@@ -1469,6 +1502,15 @@ def self_test():
     v, r = sr_verdict(0, "Geographic", "Unknown", DEG, 2237)
     check(v == REFUSE, "factoryCode 0 is refused  <-- pinned defect")
     check(any("UNDEFINED" in x for x in r), "the refusal names the undefined SR")
+    _, r = sr_verdict(0, "", "", DEG, 2237)
+    check(any("(factoryCode=0, name='Unknown')" in x for x in r),
+          "an undefined SR with an empty name is called 'Unknown', never ''")
+    _, r = target_verdict("target", 0, "", "", None)
+    check(any("target spatial reference is UNDEFINED (factoryCode=0, name='Unknown')" in x
+              for x in r), "so is an undefined target with an empty name")
+    _, r = target_verdict("target", 0, "", "  GCS_Mine ", None)
+    check(any("(factoryCode=0, name='GCS_Mine')" in x for x in r),
+          "an undefined target keeps its own name in the refusal, trimmed")
     check(any("maxSeverity 0" in x for x in r), "the refusal explains arcpy's silence")
     check(any("--assume-sr" in x for x in r), "the refusal names the override")
 
@@ -1585,6 +1627,20 @@ def self_test():
           "<-- pinned defect")
     check(extent_in_degree_range((-200.0, 10.0, 20.0, 20.0)) is False,
           "an extent with xmin -200 is not in degree range")
+    slack = []
+    for i in range(4):
+        for sign in (-1.0, 1.0):
+            for past, want in ((1e-10, True), (1e-8, False)):
+                box = [0.0, 0.0, 0.0, 0.0]
+                box[i] = sign * (bounds[i] + past)
+                slack.append(extent_in_degree_range(box) is want)
+    check(len(slack) == 16 and all(slack),
+          "each bound allows 1e-9 degrees of rounding, and not 1e-8")
+    WORLD_3857 = (-180.00000000000003, -85.0511287798066, 180.00000000000003, 85.0511287798066)
+    v, r = sr_verdict(4326, "Geographic", "GCS_WGS_1984", WORLD_3857, None)
+    check(v == ACCEPT and any("consistent with its" in x for x in r),
+          "a world extent converted from Web Mercator, x one ULP past 180, is degrees  "
+          "<-- pinned defect")
     v, _ = sr_verdict(4326, "Geographic", "GCS_WGS_1984",
                       (-6.0e6, -3.0e6, -5.9e6, -2.9e6), 2237)
     check(v == REFUSE, "a geographic .prj over all-negative Web Mercator metres is refused  "
@@ -1619,6 +1675,8 @@ def self_test():
     check(all(sr_verdict(4326, "Geographic", n, DEG, None)[0] == REFUSE
               for n in ("<undefined>", " Undefined", "NONE", "unknown")),
           "each name that means undefined is refused, whatever the code says")
+    v, _ = sr_verdict(2237, " Projected ", "StatePlane_Feet", DEG, 2237)
+    check(v == REFUSE, "an SR type padded with spaces is still read as projected")
 
     # --- field_diff ---------------------------------------------------------- #
     src = [("OBJECTID", "OID", 4), ("Shape", "Geometry", 0), ("PARCEL_ID", "String", 20),
@@ -1745,7 +1803,7 @@ def self_test():
            "a header declaring more bytes than the file holds is refused as truncated",
            needle="truncated")
     raises(lambda: parse_shp_header(shp_bytes(records=0, declare_extra=-2), 184),
-           "a header declaring less than 100 bytes is refused", needle="98 bytes")
+           "a header declaring less than 100 bytes is refused", needle="under 100 bytes")
     raises(lambda: parse_shp_header(shp_bytes(bbox=(0.0, float("nan"), 1.0, 1.0)), 184),
            "a NaN in the bounding box is refused", needle="not a real extent")
     inf = float("inf")
@@ -1901,7 +1959,7 @@ def self_test():
              "a latitude PARAMETER of 100 is not defined", "latitude PARAMETER"),
             (SPF.replace('PARAMETER["Central_Meridian",-82.0],', ""),
              "a Transverse_Mercator with no Central_Meridian is not defined",
-             "needs PARAMETER Central_Meridian"),
+             "Transverse_Mercator needs PARAMETER Central_Meridian"),
             (SPF + PRO_VCS[PRO_VCS.index(",VERTCS"):].replace("Vertical_Shift", "Bogus"),
              "a VERTCS PARAMETER Pro never writes is not defined", "VERTCS PARAMETER"),
             (WGS84[:-1] + ',UNIT["Degree",0.0174532925199433]]',
@@ -1911,7 +1969,7 @@ def self_test():
             (WGS84.replace("6378137.0", "0.0"), "a semi-major axis of 0 is not defined",
              "positive semi-major axis"),
             (WGS84.replace("298.257223563", "-5.0"),
-             "a negative inverse flattening is not defined", "non-negative inverse"),
+             "a negative inverse flattening is not defined", "flattening of 0 or at least 1"),
             (SPF + PRO_VCS[PRO_VCS.index(",VERTCS"):].replace(
                 'PARAMETER["Direction",1.0]', 'PARAMETER["Direction",1.0],'
                 'PARAMETER["Direction",1.0]'),
@@ -1945,7 +2003,12 @@ def self_test():
     # fcload refuses what it cannot verify. Loosen per node if a real .prj trips it.
     raises(lambda: parse_prj(WGS84[:-1] + ',FOO["bar"]]'),
            "a node fcload does not verify is refused, though Pro read this one",
-           needle="does not verify")
+           needle="(GEOGCS holds a node that fcload does not verify)")
+    raises(lambda: parse_prj(WGS84[:-1] + ',AUTHORITY["EPSG"]]'),
+           "the AUTHORITY refusal names the node that holds it",
+           needle="(an AUTHORITY in GEOGCS is not one name and one code)")
+    check(parse_prj(WGS84[:-1] + ',AUTHORITY["epsg","4326"]]')[0] == 4326,
+          "a lower-case authority name gives the WKID too")
 
     # ArcGIS Pro 3.6 Describe read each text below as 'Unknown', factoryCode 0, and an
     # earlier build of check printed ACCEPT for every one: the headline disaster.
@@ -1972,6 +2035,48 @@ def self_test():
              "a Foot_US UNIT in the GEOGCS of a PROJCS", "GEOGCS UNIT is not Degree")):
         raises(lambda t=text: parse_prj(t), "a .prj with %s is refused, as Pro reads it as Unknown  "
                "<-- pinned defect" % label, needle=needle)
+    ONE = "not one name and one code"
+    RA = WGS84[:-1] + ",%s]"
+    SPH = "298.257223563]"
+    # An earlier build of check printed ACCEPT, exit 0, for each text below, and Pro 3.6
+    # Describe read each one as 'Unknown', factoryCode 0.
+    for text, label, needle in (
+            (RA % 'AUTHORITY["EPSG"]', 'a root AUTHORITY["EPSG"] with no code', ONE),
+            (RA % 'AUTHORITY["ESRI"]', 'a root AUTHORITY["ESRI"] with no code', ONE),
+            (RA % "AUTHORITY[4326]", "a root AUTHORITY[4326] with no name", ONE),
+            (RA % 'AUTHORITY["EPSG",""]', "a root AUTHORITY with an empty code", ONE),
+            (RA % 'AUTHORITY["",4326]', "a root AUTHORITY with an empty name", ONE),
+            (RA % 'AUTHORITY["  ","4326"]', "a root AUTHORITY with a blank name", ONE),
+            (RA % 'AUTHORITY["EPSG","  "]', "a root AUTHORITY with a blank code", ONE),
+            (WGS84.replace(SPH + "]", SPH + ',AUTHORITY["EPSG"]]'),
+             'AUTHORITY["EPSG"] inside the DATUM', ONE),
+            (WGS84.replace(SPH, '298.257223563,AUTHORITY["EPSG"]]'),
+             'AUTHORITY["EPSG"] inside the SPHEROID', ONE),
+            (WGS84.replace("0.0174532925199433]", '0.0174532925199433,AUTHORITY["EPSG"]]'),
+             'AUTHORITY["EPSG"] inside the UNIT', ONE),
+            (SPF[:-1] + ',AUTHORITY["EPSG"]]', 'AUTHORITY["EPSG"] on a PROJCS root', ONE),
+            (SPF.replace('"Transverse_Mercator"]', '"Transverse_Mercator",AUTHORITY["EPSG"]]'),
+             'AUTHORITY["EPSG"] inside the PROJECTION', ONE),
+            (SPF.replace('"False_Northing",0.0]', '"False_Northing",0.0,AUTHORITY["EPSG"]]'),
+             'AUTHORITY["EPSG"] inside a PARAMETER', ONE),
+            (WGS84.replace(SPH + "]", SPH + ',AUTHORITY["EPSG","6326"],'
+                                            'AUTHORITY["EPSG","6326"]]'),
+             "two AUTHORITY nodes in the DATUM", "DATUM has more than one AUTHORITY"),
+            (WGS84.replace("298.257223563", "0.5"), "an inverse flattening of 0.5",
+             "flattening of 0 or at least 1"),
+            (WGS84.replace("298.257223563", "0.9999"), "an inverse flattening of 0.9999",
+             "flattening of 0 or at least 1"),
+            (WGS84.replace("298.257223563", "0.99"), "an inverse flattening of 0.99",
+             "flattening of 0 or at least 1"),
+            (WGS84.replace("298.257223563", "0.001"), "an inverse flattening of 0.001",
+             "flattening of 0 or at least 1"),
+            (SPF.replace("298.257222101", "0.5"),
+             "an inverse flattening of 0.5 in the GEOGCS of a PROJCS",
+             "flattening of 0 or at least 1"),
+            (WGS84 + ',VERTCS["v",VDATUM["d"],PARAMETER["Vertical_Shift"],UNIT["Meter",1.0]]',
+             "a VERTCS PARAMETER with no number", "PARAMETER needs a name and 1 number")):
+        raises(lambda t=text: parse_prj(t), "a .prj with %s is refused, as Pro reads it as "
+               "Unknown  <-- pinned defect" % label, needle=needle)
     ALB_SP100 = ('PROJCS["x",' + WGS84 + ',PROJECTION["Albers"],PARAMETER["False_Easting",'
                  '0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-84.0],'
                  'PARAMETER["Standard_Parallel_1",100.0],PARAMETER["Standard_Parallel_2",29.5],'
@@ -2031,7 +2136,15 @@ def self_test():
             (WGS84.replace(GU, 'UNIT["Foot_US",0.3048006096012192]'),
              "a lone GEOGCS in Foot_US", "GEOGCS UNIT is not Degree"),
             (WGS84.replace('"Greenwich",0.0', '"Greenwich",0x0'), "a hexadecimal number",
-             "PRIMEM needs a name and 1 number")):
+             "PRIMEM needs a name and 1 number"),
+            (WGS84.replace('"D_WGS_1984"', '"  "'), "a DATUM named with two spaces",
+             "DATUM needs a name"),
+            (SPF.replace('UNIT["Foot_US"', 'UNIT["  "'), "a PROJCS UNIT named with two spaces",
+             "UNIT needs a name and 1 number"),
+            (RA % "AUTHORITY[EPSG,4326]", "an AUTHORITY name that is a bare word", ONE),
+            (RA % 'AUTHORITY[4326,"EPSG"]', "an AUTHORITY with its items swapped", ONE),
+            (RA % 'AUTHORITY["EPSG","4326","x"]', "an AUTHORITY with three items", ONE),
+            (RA % 'AUTHORITY["EPSG","4326",UNIT["x",1.0]]', "a node inside an AUTHORITY", ONE)):
         raises(lambda t=text: parse_prj(t), "%s is refused, though Pro read it" % label,
                needle=needle)
     # Not measured under Pro. Each pins one parser rule that nothing above reaches.
@@ -2039,7 +2152,10 @@ def self_test():
             (WGS84[:-1] + 'AUTHORITY[]]', "an empty node with no comma before it",
              "truncated or corrupt"),
             (WGS84.replace("6378137.0", "6_378_137.0"), "an underscore before the point",
-             "SPHEROID needs a name and 2 numbers")):
+             "SPHEROID needs a name and 2 numbers"),
+            (WGS84 + "],x", "a stray ] and a word after the root", "truncated or corrupt"),
+            (WGS84 + ",5", "a number after the root", "not one VERTCS"),
+            (WGS84 + ",VERTCS", "a bare word VERTCS after the root", "not one VERTCS")):
         raises(lambda t=text: parse_prj(t), "%s is refused" % label, needle=needle)
     # Pro read these as defined, and fcload does too: the rules above stop at the boundary.
     for text, label in (
@@ -2061,7 +2177,14 @@ def self_test():
             (SPF.replace(GU, 'UNIT["Grad",0.015707963267948967]'), "a GEOGCS UNIT 'Grad'"),
             (SPF.replace(GU, 'UNIT["Gon",0.015707963267948967]'), "a GEOGCS UNIT 'Gon'"),
             (SPF.replace(GU, 'UNIT["Second",4.84813681109536e-06]'), "a GEOGCS UNIT 'Second'"),
-            (SPF_EPSG, "one root AUTHORITY")):
+            (SPF_EPSG, "one root AUTHORITY"),
+            (RA % 'AUTHORITY["IGNF","RGF93G"]', "an AUTHORITY code that is not a number"),
+            (RA % 'AUTHORITY["EPSG",-1]', "an AUTHORITY code of -1"),
+            (RA % 'AUTHORITY["EPSG",4326.5]', "an AUTHORITY code of 4326.5"),
+            (WGS84.replace(SPH + "]", SPH + ',AUTHORITY["EPSG","6326"]]'),
+             "one AUTHORITY in the DATUM"),
+            (WGS84.replace("298.257223563", "1.0"), "an inverse flattening of 1"),
+            (WGS84.replace("298.257223563", "1.0001"), "an inverse flattening of 1.0001")):
         check(parse_prj(text)[3] is True, "%s: defined, as Pro read it" % label)
 
     FIELDS = [("PARCEL_ID", "C", 20, 0), ("ACRES", "N", 12, 3), ("UNITS", "N", 5, 0),
@@ -2093,6 +2216,11 @@ def self_test():
     raises(lambda: dbf_parse(dbf_bytes([("ACRES", "N", 10, 3), ("acres", "C", 10, 0)])),
            "a .dbf that repeats a field name in another case is refused  <-- pinned defect",
            needle="'acres' twice")
+    raises(lambda: dbf_parse(dbf_bytes([("acres", "N", 10, 3), ("ACRES", "C", 10, 0)])),
+           "and in the other order, lower case first  <-- pinned defect",
+           needle="'ACRES' twice")
+    raises(lambda: dbf_parse(dbf_bytes([(b" " * 11, "C", 10, 0)])),
+           "a .dbf field name of 11 spaces has no name  <-- pinned defect", needle="no name")
     # Two GBK names whose lead bytes differ by 0x20, U+4F60 and U+6EB7: a Latin-1 lower()
     # folds them into one, and field_diff then reports nothing.
     gbk_a = dbf_parse(dbf_bytes([(b"\xc4\xe3", "C", 10, 0)]))[1]
@@ -2113,10 +2241,32 @@ def self_test():
                "it  <-- pinned defect" % claimed, needle="truncated or corrupt")
     raises(lambda: dbf_parse(three[:65 + 21]),
            "a .dbf cut after its first record is refused  <-- pinned defect",
-           needle="declares 3 records of 21 bytes after 65 bytes of header, but the file "
-                  "holds 86 bytes")
+           needle="bytes 4-11 do not fit the 86 bytes the file holds")
     raises(lambda: dbf_parse(three + b"\x1a"), "two bytes past the last record are refused: "
-           "only one end byte is allowed", needle="holds 130 bytes")
+           "only one end byte is allowed", needle="fit the 130 bytes")
+    zero = bytearray(dbf_bytes([("NAME", "C", 10, 0)], records=0))
+    zero[4:8] = struct.pack("<I", 999)
+    zero[10:12] = struct.pack("<H", 0)
+    raises(lambda: dbf_parse(bytes(zero)),
+           "a .dbf that claims 999 records of 0 bytes is refused: 0 bytes fit any count  "
+           "<-- pinned defect", needle="not 1 plus the sum of its field lengths")
+    for count, length, label in ((9, 7, "shorter"), (1, 63, "longer")):
+        fits = bytearray(three)                      # 3 x 21 bytes == 9 x 7 == 1 x 63
+        fits[4:12] = struct.pack("<IHH", count, 65, length)
+        raises(lambda b=bytes(fits): dbf_parse(b),
+               "a record length %s than the fields is refused, though it fits the file"
+               % label, needle="bytes 10-11")
+    # A secret read as a header. Bytes 4-11 of this token are b"b7c01d2e".
+    TOKEN = b"9f3ab7c01d2e4f5a6b7c8d9e0f1a2b3c\r\n"
+    said = []
+    for fn, data in ((parse_dbf_fields, TOKEN), (parse_shp_header, TOKEN * 3)):
+        try:
+            fn(data, len(data))
+        except ValueError as exc:
+            said.append(str(exc))
+    values = struct.unpack("<IHH", TOKEN[4:12]) + struct.unpack(">i", TOKEN[:4])
+    check(len(said) == 2 and not any(str(n) in m for n in values for m in said),
+          "a .dbf or .shp error names the header bytes, never their values  <-- pinned defect")
 
     # --- argument parsing ---------------------------------------------------- #
     p = build_parser()
@@ -2208,6 +2358,8 @@ def self_test():
     help_text = " ".join(p.format_help().split())
     check("so it needs --apply" in help_text, "--help says the write probe needs --apply")
     check("# no arcpy, read-only" in help_text, "--help says check needs no arcpy")
+    check("WHAT IS NEW HERE" not in help_text and "USAGE" not in help_text,
+          "--help ends with the usage lines, not the whole module docstring")
 
     # --- the write paths, driven against a stub arcpy ------------------------ #
     # Without this block the --apply gate and the post-load row-count check have
@@ -2510,7 +2662,7 @@ def self_test():
         rc, out = run_check("--source", wgs)
         check(rc == 0 and "verdict    : ACCEPT" in out,
               "check accepts a geographic .prj over a degree bbox")
-        check("'GCS_WGS_1984' (no WKID stated, Geographic)" in out,
+        check("\n  source SR  : 'GCS_WGS_1984' (no WKID stated, Geographic)\n" in out,
               "check prints the .prj name and says no WKID was stated")
         check("rows: 3" in out and "fields: 2" in out, "check reads rows and fields from the .dbf")
         check("reprojection not assessed" in out, "with no --target nothing is said about reprojection")
@@ -2522,6 +2674,8 @@ def self_test():
               "a missing .prj is its own class and is never assumed geographic  <-- pinned defect")
         check("run `fcload import` with --assume-sr WKID" in out,
               "check points the override at import, the one mode that takes it  <-- pinned defect")
+        check("\n  source SR  : 'Unknown' (no WKID stated, type unknown)\n" in out,
+              "the source SR line of a missing .prj says Unknown and type unknown")
 
         check(snapshot() == before and sorted(os.listdir(tmp)) == sorted(before),
               "check changes no byte and no timestamp and adds no file")
@@ -2550,6 +2704,9 @@ def self_test():
         check("in source, missing in target (0)" in out and "- ZONING (String)" in out and
               "! ACRES: source Double vs target String" in out,
               "check --target compares the two .dbf field lists")
+        check("\n  target SR  : 'NAD_1983_StatePlane_Florida_West_FIPS_0902_Feet' (WKID 2237, "
+              "Projected)   extent %s\n" % (SP_FEET,) in out,
+              "the target SR line names the target .prj, its WKID and its type")
         rc, out = run_check("--source", spf_epsg, "--target", spf_epsg)
         check(rc == 0 and "source WKID 2237 matches the target" in out,
               "two .prj files with the same root AUTHORITY match")
@@ -2562,6 +2719,8 @@ def self_test():
               and "target spatial reference is UNDEFINED" in out and "as-is" not in out,
               "check refuses a target with no .prj as UNDEFINED, never 'loading as-is'  "
               "<-- pinned defect")
+        check("\n  target SR  : 'Unknown' (no WKID stated, type unknown)   extent" in out,
+              "the target SR line of a missing .prj says Unknown and type unknown")
         rc, out = run_check("--source", wgs,
                             "--target", shapefile("tgt_empty_prj", prj="", bbox=SP_FEET))
         check(rc == 2 and "target spatial reference is UNDEFINED" in out,
@@ -2635,6 +2794,37 @@ def self_test():
         check(rc == 0 and "upper.PRJ" in out.replace("upper.prj", "upper.PRJ"),
               "an upper-case .PRJ beside the .shp is found")
 
+        upshp = put("UPSHP.SHP", shp_bytes())
+        put("UPSHP.prj", WGS84)
+        put("UPSHP.dbf", dbf_bytes(FIELDS[:2]))
+        rc, out = run_check("--source", upshp)
+        check(rc == 0 and "verdict    : ACCEPT" in out,
+              "an upper-case .SHP, as old ArcView and DOS exports name it, is read")
+        AUTH1 = SPF[:-1] + ',AUTHORITY["EPSG"]]'
+        rc, out = run_check("--source", shapefile("auth1", prj=AUTH1, bbox=SP_FEET))
+        check(rc == 2 and ONE in out,
+              'check refuses AUTHORITY["EPSG"], which Pro reads as Unknown  <-- pinned defect')
+        rc, out = run_check("--source", spf, "--target",
+                            shapefile("tgt_auth1", prj=AUTH1, bbox=SP_FEET))
+        check(rc == 2 and "target " in out and "tgt_auth1.shp" in out and ONE in out,
+              'and refuses it as a target too  <-- pinned defect')
+        rc, out = run_check("--source", shapefile("world", bbox=WORLD_3857))
+        check(rc == 0 and "verdict    : ACCEPT" in out,
+              "check accepts a WGS84 world extent converted from Web Mercator  <-- pinned defect")
+        put("rec0.dbf", bytes(zero))
+        rc, out = run_check("--source", shapefile("rec0", fields=None))
+        check(rc == 2 and "rows: 999" not in out and "bytes 10-11" in out,
+              "check refuses a .dbf of 999 records of 0 bytes, never 'rows: 999' and ACCEPT  "
+              "<-- pinned defect")
+        # tar restores a hard link to a file already in the folder, and os.link needs no
+        # admin on Windows, so this link is real on both hosts.
+        hard = shapefile("hard", fields=None)
+        os.link(put(".token", TOKEN), os.path.join(tmp, "hard.dbf"))
+        rc, out = run_check("--source", hard)
+        check(rc == 2 and "hard.dbf is a link, so it is not read" in out
+              and not any(str(n) in out for n in values) and "b7c01d2e" not in out,
+              "check refuses a .dbf hard linked to a secret and prints no byte of it  "
+              "<-- pinned defect")
         rc, out = run_check("--source", shapefile("empty", records=0))
         check(rc == 2 and "holds no features" in out and "100-byte header" in out,
               "check refuses an empty shapefile  <-- pinned defect")
@@ -2651,9 +2841,10 @@ def self_test():
         rc, out = run_check("--source", shapefile("pgpass", prj=SECRET))
         check(rc == 2 and "not echoed" in out and "Passw0rd" not in out,
               "check prints no byte of a .prj that is not WKT  <-- pinned defect")
-        # unzip restores links. islink is patched because a link needs admin on Windows;
-        # the Linux run in the README uses real ones. samedir.dbf stands for a link to
-        # .token in its own folder, which a rule on the resolved folder let through.
+        # unzip restores symbolic links. islink is patched because a symbolic link needs
+        # admin on Windows; the Linux run in the README uses real ones. samedir.dbf stands
+        # for a link to .token in its own folder, which a rule on the resolved folder let
+        # through.
         real_islink = os.path.islink
         os.path.islink = lambda path: os.path.basename(path) in (
             "lnkprj.prj", "lnkdbf.dbf", "lnkshp.shp", "samedir.dbf") or real_islink(path)

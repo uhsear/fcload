@@ -40,6 +40,8 @@ PASS  factoryCode 0 is refused  <-- pinned defect
 PASS  --assume-sr on a DEFINED, consistent source is refused, never ignored  <-- pinned defect
 PASS  --assume-sr 2237 on a WGS84 source into a WGS84 target is refused too  <-- pinned defect
 ...
+PASS  a world extent converted from Web Mercator, x one ULP past 180, is degrees  <-- pinned defect
+...
 PASS  an AUTHORITY on a nested UNIT is never taken for the root WKID  <-- pinned defect
 ...
 PASS  a .prj that is not WKT is never echoed: it may be ~/.pgpass  <-- pinned defect
@@ -59,10 +61,20 @@ PASS  a .prj with a number with an underscore is refused, as Pro reads it as Unk
 ...
 PASS  a .prj with two root AUTHORITY nodes is refused, as Pro reads it as Unknown  <-- pinned defect
 PASS  a .prj with a Foot_US UNIT in the GEOGCS of a PROJCS is refused, as Pro reads it as Unknown  <-- pinned defect
+PASS  a .prj with a root AUTHORITY["EPSG"] with no code is refused, as Pro reads it as Unknown  <-- pinned defect
+...
+PASS  a .prj with an inverse flattening of 0.5 is refused, as Pro reads it as Unknown  <-- pinned defect
+...
+PASS  a .dbf that repeats a field name in another case is refused  <-- pinned defect
+PASS  and in the other order, lower case first  <-- pinned defect
 ...
 PASS  two non-Latin .dbf names are never merged by letter case  <-- pinned defect
 ...
 PASS  a .dbf header that claims 0 records over 3 is refused, as Pro cannot open it  <-- pinned defect
+...
+PASS  a .dbf that claims 999 records of 0 bytes is refused: 0 bytes fit any count  <-- pinned defect
+...
+PASS  a .dbf or .shp error names the header bytes, never their values  <-- pinned defect
 ...
 PASS  --check-write without --apply is rejected: the probe is a write  <-- pinned defect
 ...
@@ -86,6 +98,7 @@ PASS  --check-write alone makes NO arcpy call at all  <-- pinned defect
 PASS  check refuses a shapefile with no .prj as UNDEFINED  <-- pinned defect
 ...
 PASS  check refuses a target with no .prj as UNDEFINED, never 'loading as-is'  <-- pinned defect
+...
 PASS  check refuses a target with an empty .prj as UNDEFINED  <-- pinned defect
 PASS  check refuses a target .prj named Unknown  <-- pinned defect
 ...
@@ -93,6 +106,12 @@ PASS  check refuses a name-only PROJCS that import reads as Unknown  <-- pinned 
 PASS  check refuses a pretty-printed .prj that import reads as Unknown  <-- pinned defect
 PASS  check refuses a target .prj that Pro cannot parse  <-- pinned defect
 PASS  an unreadable .prj stops with a message, not a traceback  <-- pinned defect
+...
+PASS  check refuses AUTHORITY["EPSG"], which Pro reads as Unknown  <-- pinned defect
+...
+PASS  check accepts a WGS84 world extent converted from Web Mercator  <-- pinned defect
+...
+PASS  check refuses a .dbf hard linked to a secret and prints no byte of it  <-- pinned defect
 ...
 PASS  check prints no byte of a .prj that is not WKT  <-- pinned defect
 PASS  check refuses a .prj that is a link  <-- pinned defect
@@ -104,7 +123,7 @@ PASS  a non-ASCII .prj name is printed escaped on a cp1252 pipe, no crash  <-- p
 PASS  check refuses a .dbf that claims 0 records over 3, never 'rows: 0' and ACCEPT  <-- pinned defect
 ...
 --------------------------------------------------------------------
-396 assertions, 0 failed
+455 assertions, 0 failed
 ```
 
 ## Requirements
@@ -124,7 +143,7 @@ inside `_arcpy()`, which only the geodatabase functions call. A missing arcpy pr
 The self-test asserts that importing `fcload` does not import arcpy, and it runs `check` with
 arcpy made unimportable.
 
-The same 396 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3).
+The same 455 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3).
 The Windows and Ubuntu outputs are identical line for line, apart from Windows line endings.
 
 fcload writes only ASCII to stdout. A `.prj` or `.dbf` can hold any byte, and a Windows pipe or
@@ -155,6 +174,10 @@ python fcload.py --self-test
 3. Source SR **projected** but its whole extent fits inside degree bounds (`|x| <= 180`,
    `|y| <= 90`): the coordinates are lat/long and the `.prj` is wrong.
 4. Source SR **geographic** but its extent falls outside them: the coordinates are projected.
+   Each bound allows `1e-9` degrees of floating-point rounding. A WGS84 world layer converted
+   from Web Mercator has `xmax = 180.00000000000003`, one step past 180. An earlier build
+   refused that correct file as "in projected units", with no override. `check` and `import`
+   share this test.
 5. A source that holds **no features**, in both modes. An empty file's extent says nothing
    about its data.
 6. Row count after the load is not `rows before + rows loaded`. Exit 1, not a quiet success.
@@ -167,9 +190,10 @@ python fcload.py --self-test
    repeats a field name in another case is corrupt, because ArcGIS field names are unique
    without regard to case. With `--target`, these rules apply to the target's files too, and
    rules 3 and 4 apply to the target's own `.prj` and bounding box, unless the target is empty.
-   A `.dbf` whose record count does not fit its file size is corrupt too. A `.shp`, `.prj` or
-   `.dbf` that is a link is refused before it is read. A `.prj` that is not WKT is refused
-   without echoing its text.
+   A `.dbf` whose record length is not the total of its fields, or whose record count does
+   not fit its file size, is corrupt too. A `.shp`, `.prj` or `.dbf` that is a symbolic or
+   hard link is refused before it is read. A `.prj` that is not WKT is refused without
+   echoing its text, and a header error names the bytes, not their values.
 
 ## Usage
 
@@ -197,8 +221,9 @@ It opens every file read-only and writes nothing. It reads three things:
 - The `.dbf` header (dBASE III): the record count and the field descriptors. With `--target`,
   the two field lists go through the same `field_diff` that `diff` uses. A field name that
   repeats in another case is refused, because `field_diff` would keep only the last one. The
-  record count must fit the file: the header length plus the count times the record length
-  (bytes 10-11) is the file size, with or without one `0x1A` end byte.
+  record length (bytes 10-11) must be 1 plus the sum of the field lengths (byte 16 of each
+  field descriptor). The record count must fit the file: the header length plus the count
+  times the record length is the file size, with or without one `0x1A` end byte.
 
 **A `.prj` is defined only when ArcGIS Pro can read it.** Pro 3.6 reads a `.prj` that it
 cannot parse as `Unknown`, factoryCode 0. That is the undefined case, and a plain arcpy load
@@ -215,7 +240,8 @@ A user who ran `check` on Linux and then loaded with plain arcpy got the disaste
 this page. `check` now counts a `.prj` as defined only when it has this structure:
 
 - A `GEOGCS` has a name and one each of `DATUM`, `PRIMEM` and `UNIT`. The `DATUM` has a name
-  and a named `SPHEROID`, with a semi-major axis above 0 and an inverse flattening of 0 or more.
+  and a named `SPHEROID`, with a semi-major axis above 0 and an inverse flattening of 0 (a
+  sphere) or at least 1.
   The `PRIMEM` is from -180 to 180. The `UNIT` factor is above 0.
 - A `PROJCS` has a name, one such `GEOGCS`, one `PROJECTION` and one `UNIT` with a factor above
   0. The `PROJECTION` is one of the 77 that Pro 3.6 writes. The `PARAMETER`s are the ones that
@@ -230,7 +256,8 @@ this page. `check` now counts a `.prj` as defined only when it has this structur
 - Whitespace between tokens is a space, tab, VT, FF or CR, and nothing else. A number is
   ASCII: an optional sign, digits with an optional point, and an optional exponent.
 - The `GEOGCS` `UNIT` is `Degree`, `Grad`, `Gon` or `Second`, in any letter case.
-- The root has at most one `AUTHORITY`.
+- Each node has at most one `AUTHORITY`. An `AUTHORITY` holds a quoted name and a code, and
+  nothing else. Neither may be empty or blank. The code is quoted or a number.
 
 A `.prj` that breaks a rule is refused, and the message names the rule. The first file above,
 under Pro and then on Ubuntu:
@@ -261,10 +288,11 @@ The rules were measured with ArcGIS Pro 3.6 in two ways:
 - Pro wrote a shapefile for each of 7,425 coordinate systems, one for each WKID that
   `arcpy.ListSpatialReferences` lists, and for 30 horizontal and vertical pairs. `check`
   reads all 7,455 of those `.prj` files as defined.
-- Pro `Describe` read 242 hand-made `.prj` files. `check` accepts none that Pro read as
-  `Unknown`. It refuses 43 that Pro can read, for example an unknown node such as `FOO["bar"]`,
-  a `GEOGCS` with no `PRIMEM`, a trailing comma, or a lone `GEOGCS` in feet. Those refusals are
-  deliberate: fcload refuses what it cannot verify.
+- Pro `Describe` read 285 hand-made `.prj` files. `check` accepts none that Pro read as
+  `Unknown`. It refuses 49 that Pro can read, for example an unknown node such as `FOO["bar"]`,
+  a `GEOGCS` with no `PRIMEM`, a trailing comma, a lone `GEOGCS` in feet, or
+  `AUTHORITY[EPSG,4326]` with a bare word. Those refusals are deliberate: fcload refuses what
+  it cannot verify.
 
 An earlier version of that second claim was false. It counted 146 files and no false ACCEPT.
 An audit then found 14 files that Pro reads as `Unknown` and `check` accepted, exit 0. Each is
@@ -287,6 +315,27 @@ $ python3 fcload.py check --source bundle/nbsp.shp
 fcload check (read-only, arcpy is not imported)
   verdict    : REFUSE
     - source bundle/nbsp.shp: the .prj is not a spatial reference fcload can verify (GEOGCS holds a node that fcload does not verify). ArcGIS Pro 3.6 reads a .prj it cannot parse as UNDEFINED, 'Unknown' with factoryCode 0
+```
+
+The next count, 242 files, was false too. A later audit and a follow-up measurement found 18
+more files that Pro reads as `Unknown` and `check` accepted, exit 0. Each is the valid WGS84 or
+StatePlane WKT with one change:
+
+- An `AUTHORITY` that is not one name and one code: `AUTHORITY["EPSG"]`, `AUTHORITY["ESRI"]`,
+  `AUTHORITY[4326]`, an empty or blank name or code, on the root or inside a `DATUM`,
+  `SPHEROID`, `UNIT`, `PROJECTION` or `PARAMETER`. `check` checked only how many `AUTHORITY`
+  nodes the root held.
+- Two `AUTHORITY` nodes inside the `DATUM`.
+- An inverse flattening of 0.001, 0.5, 0.99 or 0.9999. Pro reads 0, 1 and 1.0001.
+
+`check` now refuses all 18, and the self-test pins them. Under Pro, `import` refused four of
+them as UNDEFINED, at least one of each kind. On Ubuntu, with `AUTHORITY["EPSG"]` on the root:
+
+```
+$ python3 fcload.py check --source bundle/auth.shp
+fcload check (read-only, arcpy is not imported)
+  verdict    : REFUSE
+    - source bundle/auth.shp: the .prj is not a spatial reference fcload can verify (an AUTHORITY in GEOGCS is not one name and one code). ArcGIS Pro 3.6 reads a .prj it cannot parse as UNDEFINED, 'Unknown' with factoryCode 0
 ```
 
 An unreadable `.shp`, `.prj` or `.dbf` stops `check` with exit 1 and names the file. On Ubuntu,
@@ -330,20 +379,68 @@ fcload check (read-only, arcpy is not imported)
 (exit 2)
 ```
 
-`grep` found no byte of the password or the token in the three logs. The self-test cannot make
-a link on Windows without admin rights, so it covers the link rule by patching
-`os.path.islink`.
+The build before this one tested `os.path.islink` only, so a hard link passed it. GNU tar
+1.35 restores a hard-link entry in an archive to a file that already exists in the folder. A bundle can carry
+`roads.dbf` as a hard link to `.token`, and `tar xf` in a folder that holds `.token` makes
+`roads.dbf` a second name for it. The previous build then read the token as a dBASE header. Its
+size error printed the record count, header length and record length as decimal numbers,
+`811808610`, `25649` and `25906`. Packed back into bytes, they are 8 bytes of the token,
+`b7c01d2e`. `check` now also refuses a file with more than one hard link (`st_nlink > 1`).
+A header error names the bytes that are wrong, not their values. The same Ubuntu run, with a
+synthetic 34-byte `.token` and a tar file built with Python's `tarfile`:
+
+```
+$ cd inbox && tar xf ../bundle.tar && stat -c '%n %h' roads.dbf
+roads.dbf 2
+$ python3 fcload.py check --source inbox/roads.shp
+fcload check (read-only, arcpy is not imported)
+  verdict    : REFUSE
+    - source inbox/roads.shp: roads.dbf is a link, so it is not read: it could point at any file, such as ~/.pgpass
+(exit 2)
+```
+
+`grep` found no byte of the password or the token in the four logs, as text or as those decimal
+numbers. The self-test cannot make a symbolic link on Windows without admin rights, so it covers
+that rule by patching `os.path.islink`. A hard link needs no admin rights, so the self-test
+makes a real one with `os.link` on both hosts.
 
 A `.dbf` whose header states the wrong record count is refused too. ArcGIS Pro 3.6 cannot open
 one: `GetCount` on a Pro shapefile whose `.dbf` count was patched to 0, 2 or 5 over 3 records
 raised `ERROR 000229: Cannot open`, and `import` stopped with that traceback. An earlier build of
-`check` printed `rows: 0` and ACCEPT for the first. Now, on Ubuntu:
+`check` printed `rows: 0` and ACCEPT for the first. The next build checked the count against the
+file size, but not the record length against the fields. A record length of 0 fits any count,
+so a `.dbf` with no records whose header claimed 999 got `rows: 999` and ACCEPT. Now, on Ubuntu:
 
 ```
 $ python3 fcload.py check --source bundle/counted.shp
 fcload check (read-only, arcpy is not imported)
   verdict    : REFUSE
-    - source bundle/counted.shp: the .dbf header declares 0 records of 11 bytes after 65 bytes of header, but the file holds 99 bytes: truncated or corrupt
+    - source bundle/counted.shp: the .dbf record count and lengths at bytes 4-11 do not fit the 99 bytes the file holds: truncated or corrupt
+(exit 2)
+$ python3 fcload.py check --source bundle/ghost.shp
+fcload check (read-only, arcpy is not imported)
+  verdict    : REFUSE
+    - source bundle/ghost.shp: the .dbf record length at bytes 10-11 is not 1 plus the sum of its field lengths: truncated or corrupt
+(exit 2)
+```
+
+A `.dbf` that ArcGIS Pro 3.6 wrote, with text fields of 254 and 1 characters and Double, Long,
+Short, Float and Date fields, passes the record-length rule.
+
+The degree-bounds slack, on Ubuntu, for the WGS84 world layer from rule 4:
+
+```
+$ python3 fcload.py check --source bundle/world.shp
+fcload check (read-only, arcpy is not imported)
+  source     : bundle/world.shp
+  geometry   : Point   rows: 3   fields: 1
+  .prj       : bundle/world.prj
+  source SR  : 'GCS_WGS_1984' (no WKID stated, Geographic)
+  extent     : (-180.00000000000003, -85.0511287798066, 180.00000000000003, 85.0511287798066)   (.shp header, bytes 36-67)
+  verdict    : ACCEPT
+    - spatial reference 'GCS_WGS_1984' (no WKID stated, Geographic) is consistent with its extent
+    - no target WKID to compare with: reprojection not assessed
+(exit 0)
 ```
 
 A real run on shapefiles that ArcGIS Pro 3.6 wrote, then the same file with its `.prj` deleted.
@@ -549,61 +646,89 @@ and no warning to grep for. fcload inverts that. Undefined is the loudest failur
 way past is an explicit, recorded `--assume-sr`.
 
 Each of these mutations was applied to a copy of `fcload.py` and fails the suite. The first
-failing line and the number of the 396 assertions that failed are quoted. Windows and Ubuntu
+failing line and the number of the 455 assertions that failed are quoted. Windows and Ubuntu
 gave the same lines. "1.0.0 --check-write rule back" restores both halves of the 1.0.0 rule:
 `validate_args` refuses `--check-write` only together with `--apply`, and `check_write` probes
 without asking. "well-bracketed .prj = defined" restores the earlier `check` rule, which took
 the root's name and did not check its structure. "folder link rule back" restores the rule
-that refused only a link out of the folder. "Unicode whitespace read" restores `\s` and
-`strip()`.
+that refused only a link out of the folder, and "islink-only link rule back" the rule that
+missed hard links. "Unicode whitespace read" restores `\s` and `strip()`.
 
 ```
-undefined treated as fine      -> FAIL  factoryCode 0 is refused  <-- pinned defect   30 failed
+undefined treated as fine      -> FAIL  factoryCode 0 is refused  <-- pinned defect   29 failed
 --apply gate removed           -> FAIL  import without --apply performs NO write call  <-- pinned defect   3 failed
 row-count check removed        -> FAIL  a short row count after the load FAILS the import  <-- pinned defect   4 failed
 1.0.0 --check-write rule back  -> FAIL  --check-write without --apply is rejected: the probe is a write  <-- pinned defect   12 failed
-undefined target accepted      -> FAIL  import refuses a feature dataset whose SR is undefined  <-- pinned defect   7 failed
-missing .prj read as WGS84     -> FAIL  check refuses a shapefile with no .prj as UNDEFINED  <-- pinned defect   5 failed
-nested AUTHORITY read as WKID  -> FAIL  an AUTHORITY on a nested UNIT is never taken for the root WKID  <-- pinned defect, then the self-test stops, exit 1
+undefined target accepted      -> FAIL  so is an undefined target with an empty name   8 failed
+missing .prj read as WGS84     -> FAIL  check refuses a shapefile with no .prj as UNDEFINED  <-- pinned defect   7 failed
+nested AUTHORITY read as WKID  -> FAIL  an AUTHORITY on a nested UNIT is never taken for the root WKID  <-- pinned defect   2 failed
 truncated .prj read anyway     -> FAIL  a truncated .prj is refused, not read from its prefix  <-- pinned defect (wrong exception IndexError('list index out of range')), then the self-test stops, exit 1
-well-bracketed .prj = defined  -> FAIL  a name-only PROJCS is not defined  <-- pinned defect (no error raised)   49 failed
+well-bracketed .prj = defined  -> FAIL  a name-only PROJCS is not defined  <-- pinned defect (no error raised)   56 failed
 newline rule dropped           -> FAIL  WKT with a newline inside is not defined: Pro reads only its first line  <-- pinned defect   3 failed
-junk VERTCS accepted unread    -> FAIL  a junk VERTCS after a valid root is not accepted unread  <-- pinned defect (no error raised)   5 failed
+junk VERTCS accepted unread    -> FAIL  a junk VERTCS after a valid root is not accepted unread  <-- pinned defect (no error raised)   6 failed
 VERTCS tail refused again      -> self-test stops, exit 1: ValueError: the .prj WKT is truncated or corrupt: text follows its root that is not one VERTCS
-duplicate .dbf names allowed   -> FAIL  a .dbf that repeats a field name in another case is refused  <-- pinned defect (no error raised)   1 failed
+duplicate .dbf names allowed   -> FAIL  a .dbf that repeats a field name in another case is refused  <-- pinned defect (no error raised)   2 failed
 empty import source loaded     -> FAIL  import refuses an empty source, as check does, and writes nothing  <-- pinned defect   1 failed
 output not escaped             -> self-test stops, exit 1: UnicodeEncodeError: 'charmap' codec can't encode characters in position 16-17: character maps to <undefined>
 --assume-sr on a defined SR    -> FAIL  --assume-sr on a DEFINED, consistent source is refused, never ignored  <-- pinned defect   4 failed
 root target WKID ignored       -> FAIL  an EXISTING root feature class supplies the target WKID to the verdict  <-- pinned defect   1 failed
 .prj text echoed               -> FAIL  a .prj that is not WKT is never echoed: it may be ~/.pgpass  <-- pinned defect   4 failed
-.prj link followed             -> FAIL  check refuses a .prj that is a link  <-- pinned defect   4 failed
-folder link rule back          -> FAIL  check refuses a .prj that is a link  <-- pinned defect   4 failed
+.prj link followed             -> FAIL  check refuses a .dbf hard linked to a secret and prints no byte of it  <-- pinned defect   5 failed
+folder link rule back          -> FAIL  check refuses a .dbf hard linked to a secret and prints no byte of it  <-- pinned defect   5 failed
+islink-only link rule back     -> FAIL  check refuses a .dbf hard linked to a secret and prints no byte of it  <-- pinned defect   1 failed
 Unicode whitespace read        -> FAIL  a .prj with an NBSP after a comma is refused, as Pro reads it as Unknown  <-- pinned defect (no error raised)   10 failed
 float() reads any number       -> FAIL  a .prj with a number with an underscore is refused, as Pro reads it as Unknown  <-- pinned defect (no error raised)   2 failed
-two root AUTHORITY allowed     -> FAIL  a .prj with two root AUTHORITY nodes is refused, as Pro reads it as Unknown  <-- pinned defect (no error raised)   1 failed
+two AUTHORITY nodes allowed    -> FAIL  a .prj with two root AUTHORITY nodes is refused, as Pro reads it as Unknown  <-- pinned defect (no error raised)   2 failed
+AUTHORITY structure unchecked  -> FAIL  the AUTHORITY refusal names the node that holds it   22 failed
+flattening under 1 read        -> FAIL  a .prj with an inverse flattening of 0.5 is refused, as Pro reads it as Unknown  <-- pinned defect (no error raised)   5 failed
+world extent refused again     -> FAIL  each bound allows 1e-9 degrees of rounding, and not 1e-8   3 failed
+record length unchecked        -> FAIL  a .dbf that claims 999 records of 0 bytes is refused: 0 bytes fit any count  <-- pinned defect (no error raised)   4 failed
 GEOGCS unit not checked        -> FAIL  a .prj with a Foot_US UNIT in the GEOGCS of a PROJCS is refused, as Pro reads it as Unknown  <-- pinned defect (no error raised)   4 failed
 .dbf size not checked          -> FAIL  a .dbf header that claims 0 records over 3 is refused, as Pro cannot open it  <-- pinned defect (no error raised)   6 failed
 --check-write advice on check  -> FAIL  check --check-write gives one error, never the advice to add --apply  <-- pinned defect   1 failed
 usage error exits 2 again      -> FAIL  an unknown subcommand is a usage error, exit 1, not the refusal code 2  <-- pinned defect   2 failed
 ```
 
-The same audit found refusal rules that no assertion could fail. In the earlier build, each of
-these mutations left the self-test at `325 assertions, 0 failed`, and `check` then accepted a
-`.prj` that Pro reads as `Unknown`: the `PROJCS` `UNIT` check removed, the `DATUM` name check
-removed, the non-finite number filter removed, or `abs()` dropped from the `PRIMEM` or the
-latitude rule. With the rule that a node needs its numbers removed, `check` crashed with
-`IndexError` instead. `DEGREE_X` widened from 180 to 199 also left 325 of 325, because the
-degree test built its boxes from `DEGREE_X` itself. That test now uses the literals 180 and 90,
-and each rule has an assertion that fails when the rule is deleted or loosened.
+An audit of an earlier build found refusal rules that no assertion could fail. Each of these
+mutations left the self-test at `325 assertions, 0 failed`, and `check` then accepted a `.prj`
+that Pro reads as `Unknown`: the `PROJCS` `UNIT` check removed, the `DATUM` name check removed,
+the non-finite number filter removed, or `abs()` dropped from the `PRIMEM` or the latitude
+rule. `DEGREE_X` widened from 180 to 199 also left 325 of 325, because the degree test built
+its boxes from `DEGREE_X` itself. That test now uses the literals 180 and 90.
 
-A wider sweep of 139 one-line mutations covers the parsers and each `.prj` structure rule, the
-degree-bounds check, the target rule, the link rule, the write gates, the flag checks and the
-tracking-name vote. It leaves three alive on Ubuntu, and all three are equivalent.
-`pos + 32 >= end` in the `.dbf` loop refuses the same headers one step earlier. `check` passing
-`prj_defined=True` changes nothing, because a missing `.prj` also has an empty name, which is
-undefined on its own. `\s` in the pattern for the space before a `[` changes nothing, because
-the word before it has already taken every character that is not ASCII whitespace. On Windows a
-fourth survives: the upper-case `.PRJ` lookup, because NTFS finds `upper.PRJ` under either case.
+The next build claimed that each rule had an assertion that fails when the rule is deleted or
+loosened, and that claim was false. A later audit loosened four rules, and the suite still
+printed `396 assertions, 0 failed`. Each mutant then accepted a file that the shipped code
+refused: `.lower()` dropped from the new name in the duplicate `.dbf` field test (`acres` then
+`ACRES`), `.strip()` dropped from a `.dbf` field name (11 spaces), a blank node name such as
+`DATUM["  "]`, and a `VERTCS` `PARAMETER` with no number. Two guards that stop a hostile `.prj`
+from raising a traceback could fail no assertion either, nor could the upper-case `.SHP` test or
+the `source SR` and `target SR` lines. The self-test now pins each of them.
+
+Two sweeps now check the claim. The first applies 168 named one-line mutations to the
+parsers and each `.prj` structure rule, the degree-bounds check, the target rule, the link
+rules, the write gates, the flag checks and the tracking-name vote. It leaves three alive on
+Ubuntu, and all three are equivalent. `pos + 32 >= end` in the `.dbf` loop refuses the same
+headers one step earlier. `check` passing `prj_defined=True` changes nothing,
+because a missing `.prj` also has an empty name, which is undefined on its own. `\s` in the
+pattern for the space before a `[` changes nothing, because the word before it has already taken
+every character that is not ASCII whitespace. On Windows a fourth survives: the upper-case
+`.PRJ` lookup, because NTFS finds `upper.PRJ` under either case.
+
+The second sweep, on Windows, swaps one operator or constant at a time on every line from
+`extent_in_degree_range` to the end of `cmd_check`: `==` and `!=`, `<` and `<=`, `and` and
+`or`, `not`, `in`, `0` and `1`, `.strip()`, `.lower()`, `abs()` and others. Of 486 mutants,
+73 survive. 53 of them change a docstring. None of the other 20 lets a refused input through:
+
+- 4 change `<=` to `<` at the edge of the `1e-9` slack, which differs for one float value.
+- 2 drop one of two `strip()` calls on the same name, 1 drops a `.lower()` on names that are
+  already lower case, and 1 widens a slice to the name string, which the number filter drops.
+- 4 change how the `.dbf` header checks reach the same refusal.
+- 2 change `_sibling`'s `return None` into a value that is just as false.
+- 3 change only the wording of a message, such as `1 numbers`.
+- 2 refuse more: a semi-major axis up to 1, and `--assume-sr 1`.
+- 1 is the Windows-only `.PRJ` survivor above.
+
 Some mutants stop the self-test with an exception instead of a `FAIL` line. That is still
 exit 1.
 
@@ -642,8 +767,8 @@ all of the work; the only thing claimed as new here is the refusal gate in front
    because `Describe` gives it factoryCode 0 (limitation 12). Under Pro 3.6, a `GEOGCS`
    renamed to `GCS_Mine` got ACCEPT from `check` and REFUSE from `import`.
 8. `check` reads headers, not records. It trusts the header bounding box and does not read the
-   `.shx` or the `.cpg`. The `.dbf` record count is checked against the `.dbf` file size, not
-   against the number of shapes in the `.shp`. A `.prj` is decoded as UTF-8, and a UTF-16
+   `.shx` or the `.cpg`. The `.dbf` record count is checked against the `.dbf` file size and
+   the record length against the fields, not against the number of shapes in the `.shp`. A `.prj` is decoded as UTF-8, and a UTF-16
    `.prj` is refused as not WKT. A `.dbf` field name keeps each byte above `0x7F` as an escape such as `\xc4`, because
    without the `.cpg` its letter case is unknown. Letter case is ignored for ASCII letters only.
    Two names that differ only in a non-ASCII letter's case are reported as two fields, which
@@ -666,10 +791,13 @@ all of the work; the only thing claimed as new here is the refusal gate in front
     dataset was stored at `(611497.11, 1765401.34)`. `Append` into a root feature class in
     WKID 2237 stored `(611496.05, 1765403.33)`, about 2.3 ft away. For a datum change that
     matters, project the source in ArcGIS Pro with the transformation you choose, then load it.
-14. The link rule sees symbolic links only, so a hard link passes it. A `.dbf` hard linked
-    to a file elsewhere is read, and a field name from it can print. A hard-linked `.prj` is
-    read too, but not echoed. On Ubuntu, `zip` then `unzip` of a hard-linked pair restored two
-    separate files, each with a link count of 1.
+14. `check` refuses a `.shp`, `.prj` or `.dbf` with more than one hard link, even one linked
+    on purpose, for example by a backup tool that saves space with hard links. Copy the
+    shapefile to a new folder first. The link test and the read are two steps, so a file
+    swapped for a link between them is read.
+15. `check` reads a `.dbf` field length from byte 16 only. Some writers store a text field
+    longer than 255 bytes with byte 17 as a high byte. Such a `.dbf` fails the record-length
+    rule and is refused as corrupt.
 
 ## Contributing
 
