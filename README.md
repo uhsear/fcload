@@ -53,6 +53,8 @@ PASS  a Lambert_Conformal_Conic_1SP .prj as Pro writes it is defined  <-- pinned
 PASS  a name-only PROJCS is not defined  <-- pinned defect
 PASS  WKT with a newline inside is not defined: Pro reads only its first line  <-- pinned defect
 ...
+PASS  a .prj whose first line is empty, as Pro reads it as Unknown  <-- pinned defect
+...
 PASS  a junk VERTCS after a valid root is not accepted unread  <-- pinned defect
 ...
 PASS  a .prj with an NBSP after a comma is refused, as Pro reads it as Unknown  <-- pinned defect
@@ -123,7 +125,7 @@ PASS  a non-ASCII .prj name is printed escaped on a cp1252 pipe, no crash  <-- p
 PASS  check refuses a .dbf that claims 0 records over 3, never 'rows: 0' and ACCEPT  <-- pinned defect
 ...
 --------------------------------------------------------------------
-455 assertions, 0 failed
+462 assertions, 0 failed
 ```
 
 ## Requirements
@@ -143,7 +145,7 @@ inside `_arcpy()`, which only the geodatabase functions call. A missing arcpy pr
 The self-test asserts that importing `fcload` does not import arcpy, and it runs `check` with
 arcpy made unimportable.
 
-The same 455 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3).
+The same 462 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3).
 The Windows and Ubuntu outputs are identical line for line, apart from Windows line endings.
 
 fcload writes only ASCII to stdout. A `.prj` or `.dbf` can hold any byte, and a Windows pipe or
@@ -246,12 +248,16 @@ this page. `check` now counts a `.prj` as defined only when it has this structur
 - A `PROJCS` has a name, one such `GEOGCS`, one `PROJECTION` and one `UNIT` with a factor above
   0. The `PROJECTION` is one of the 77 that Pro 3.6 writes. The `PARAMETER`s are the ones that
   Pro writes for that projection. None repeats, and each latitude is from -90 to 90.
-- A `LINUNIT`, which Pro writes for a 3D system, is checked like a `UNIT`.
+- A `LINUNIT`, which Pro writes for a 3D system, is checked like a `UNIT`. A `PROJCS` has a
+  `LINUNIT` only when its `GEOGCS` has one too, as Pro writes a 3D system. Pro 3.6 reads a
+  2D StatePlane `PROJCS` with `LINUNIT["Meter",1.0]` added as `Unknown`.
 - One `VERTCS` can follow the root, as Pro writes `PROJCS[...],VERTCS[...]`. It has a name, a
   `VDATUM` (or, for an ellipsoidal height, a `DATUM` with a `SPHEROID`), and a `UNIT` with a
   factor above 0. Its only parameters are `Vertical_Shift` and `Direction`.
 - The WKT is on one line. Pro reads only the first line, so pretty-printed WKT is `Unknown` to
-  it. A trailing line break, a lone CR, a tab and `, ` are whitespace to both.
+  it. A trailing line break, a lone CR, a tab and `, ` are whitespace to both. A `.prj` that
+  starts with a line break (LF or CRLF) has an empty first line, and Pro 3.6 reads it as
+  `Unknown`.
 - The file does not start with a UTF-8 byte-order mark. Pro reads such a file as `Unknown`.
 - Whitespace between tokens is a space, tab, VT, FF or CR, and nothing else. A number is
   ASCII: an optional sign, digits with an optional point, and an optional exponent.
@@ -293,6 +299,10 @@ The rules were measured with ArcGIS Pro 3.6 in two ways:
   a `GEOGCS` with no `PRIMEM`, a trailing comma, a lone `GEOGCS` in feet, or
   `AUTHORITY[EPSG,4326]` with a bare word. Those refusals are deliberate: fcload refuses what
   it cannot verify.
+- A later sweep of 85 more hand-made files found 3 that Pro reads as `Unknown` and `check`
+  accepted: the WGS84 `.prj` after a leading LF, the same after a leading CRLF, and a 2D
+  `PROJCS` with a `LINUNIT`. `check` now refuses all 3. Of those 85 files, it refuses 8 that
+  Pro can read.
 
 An earlier version of that second claim was false. It counted 146 files and no false ACCEPT.
 An audit then found 14 files that Pro reads as `Unknown` and `check` accepted, exit 0. Each is
@@ -646,7 +656,7 @@ and no warning to grep for. fcload inverts that. Undefined is the loudest failur
 way past is an explicit, recorded `--assume-sr`.
 
 Each of these mutations was applied to a copy of `fcload.py` and fails the suite. The first
-failing line and the number of the 455 assertions that failed are quoted. Windows and Ubuntu
+failing line and the number of assertions that failed, out of 455 in that build, are quoted. Windows and Ubuntu
 gave the same lines. "1.0.0 --check-write rule back" restores both halves of the 1.0.0 rule:
 `validate_args` refuses `--check-write` only together with `--apply`, and `check_write` probes
 without asking. "well-bracketed .prj = defined" restores the earlier `check` rule, which took
@@ -773,8 +783,11 @@ all of the work; the only thing claimed as new here is the refusal gate in front
    without the `.cpg` its letter case is unknown. Letter case is ignored for ASCII letters only.
    Two names that differ only in a non-ASCII letter's case are reported as two fields, which
    is a false alarm, never a false match. Non-ASCII characters print as backslash escapes.
-9. `check` names `.dbf` types from the dBASE letter: `C` String, `D` Date, `L` Logical, and `N`
-   or `F` Integer when it has no decimals, else Double. arcpy can name the same field
+9. `check` names `.dbf` types from the dBASE letter and width, as Pro 3.6 `ListFields` named
+   them for widths 1 to 20: `C` String, `D` Date, `L` Logical. `N` with no decimals is
+   SmallInteger up to width 4, Integer up to 10, else Double. `N` with decimals is Single up to
+   width 8, else Double. `F` is Single up to width 13, else Double. Text field lengths are not
+   compared, in `check` or in `diff`. Other writers or Pro versions can name a field
    differently, so compare `check` output with `check` output. arcpy also counts `FID` and
    `Shape`, so `import` showed `fields: 5` where `check` showed `fields: 3`.
 10. `--check-write --apply` deletes a table already named `fcload_write_probe` before it
@@ -798,6 +811,12 @@ all of the work; the only thing claimed as new here is the refusal gate in front
 15. `check` reads a `.dbf` field length from byte 16 only. Some writers store a text field
     longer than 255 bytes with byte 17 as a high byte. Such a `.dbf` fails the record-length
     rule and is refused as corrupt.
+16. `check` reads the first 64 KiB of a `.prj` and ignores the rest. A `.prj` padded past that
+    size with whitespace can hide a trailing node that makes Pro read it as `Unknown`.
+17. `check` takes the root `AUTHORITY` code as the WKID without comparing it with the root
+    keyword. A `GEOGCS` that states a projected code, such as 2237, is reported with that code,
+    and `check --target` then prints `matches the target: no reprojection` for a target in 2237.
+    `check` also reads a code in non-ASCII digits, such as Arabic-Indic digits, as a number.
 
 ## Contributing
 

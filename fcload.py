@@ -676,7 +676,12 @@ def _prj_projcs(p):
     """Refuse a PROJCS without a valid GEOGCS, a known PROJECTION with the PARAMETERs
     Pro writes for it, and a UNIT with a positive factor."""
     name = _prj_named(p)[0]
-    _prj_geogcs(_prj_one(p, "GEOGCS"))
+    geog = _prj_one(p, "GEOGCS")
+    _prj_geogcs(geog)
+    # Pro writes a PROJCS LINUNIT only over a 3D GEOGCS that has one too (WKID 9895).
+    # Measured: a 2D StatePlane PROJCS with LINUNIT["Meter",1.0] added is 'Unknown'.
+    if _prj_nodes(p, "LINUNIT") and not _prj_nodes(geog, "LINUNIT"):
+        raise _prj_fail("a PROJCS LINUNIT needs a GEOGCS with a LINUNIT, as in a 3D system")
     known = _PRJ_REQUIRED.get(_prj_named(_prj_one(p, "PROJECTION"))[0].lower())
     if not known:
         raise _prj_fail("its PROJECTION is none of the %d that ArcGIS Pro 3.6 writes"
@@ -750,9 +755,13 @@ def parse_prj(text):
     on the raw coordinates. Every rule below was measured against Pro 3.6 Describe. Some
     refuse more than Pro does, such as a node fcload does not know: refused, not guessed.
     """
-    text = (text or "").strip(_WS + "\n")
+    # Leading whitespace goes, but not a leading line break: Pro reads only the first
+    # line, so a .prj that starts "\n" or "\r\n" is 'Unknown' to Pro 3.6 (measured).
+    text = (text or "").rstrip(_WS + "\n").lstrip(_WS)
     if not text:
         return 0, "", "", False
+    if text.startswith("\n"):
+        raise _prj_fail("its first line is empty, and Pro reads only the first line")
     if text.startswith(u"\ufeff"):
         raise _prj_fail("it starts with a UTF-8 byte-order mark")
     kw = _PRJ_KEYWORD.match(text)
@@ -792,10 +801,12 @@ def parse_prj(text):
     return wkid, kind, name, True
 
 
-def _dbf_type(letter, decimals):
-    """A dBASE field type letter as field_diff compares it."""
+def _dbf_type(letter, width, decimals):
+    """A dBASE field as Pro 3.6 ListFields names its type, measured on widths 1-20."""
+    if letter == "N" and not decimals:
+        return "SmallInteger" if width <= 4 else "Integer" if width <= 10 else "Double"
     if letter in ("N", "F"):
-        return "Double" if decimals else "Integer"
+        return "Single" if width <= (8 if letter == "N" else 13) else "Double"
     return DBF_TYPES.get(letter, letter)
 
 
@@ -835,7 +846,7 @@ def parse_dbf_fields(data, size):
         if name.lower() in (n.lower() for n, _ in fields):
             raise ValueError("the .dbf names the field %r twice (field names are "
                              "unique without regard to case)" % name)
-        fields.append((name, _dbf_type(desc[11:12].decode("latin-1"), desc[17])))
+        fields.append((name, _dbf_type(desc[11:12].decode("latin-1"), desc[16], desc[17])))
         width += desc[16]
         pos += 32
     # ponytail: byte 17 is not read as a high length byte for text fields over 255 bytes,
@@ -1011,11 +1022,13 @@ def cmd_check(ns):
                                           src["sr_type"] or "type unknown"))
     print("  extent     : %s   (.shp header, bytes 36-67)" % (src["bbox"],))
 
-    if src["empty"] or src["shape_type"] == 0:
+    if src["empty"] or src["shape_type"] == 0 or src["rows"] == 0:
         print("  verdict    : REFUSE")
         print("    - the source holds no features (%s): its bounding box says nothing "
               "about where the data is" % ("the .shp is its 100-byte header alone"
-                                            if src["empty"] else "shape type 0, Null"))
+                                            if src["empty"] else "shape type 0, Null"
+                                            if src["shape_type"] == 0 else
+                                            "the .dbf holds 0 records"))
         return 2
 
     target_wkid = None
@@ -1933,6 +1946,10 @@ def self_test():
              "WKT with a newline inside is not defined: Pro reads only its first line  "
              "<-- pinned defect", "split across lines"),
             (WGS84.replace("],", "],\r\n"), "nor is WKT split by CRLF", "split across lines"),
+            ("\n" + WGS84, "a .prj whose first line is empty, as Pro reads it as Unknown  "
+             "<-- pinned defect", "first line is empty"),
+            ("\r\n" + WGS84, "a .prj that starts with CRLF  <-- pinned defect",
+             "first line is empty"),
             (WGS84 + ',VERTCS["v"]',
              "a junk VERTCS after a valid root is not accepted unread  <-- pinned defect",
              "VERTCS has no VDATUM"),
@@ -2013,6 +2030,12 @@ def self_test():
     # ArcGIS Pro 3.6 Describe read each text below as 'Unknown', factoryCode 0, and an
     # earlier build of check printed ACCEPT for every one: the headline disaster.
     GU = 'UNIT["Degree",0.0174532925199433]'
+    SPF3D = SPF.replace(GU + "]", GU + ',LINUNIT["Meter",1.0]]')
+    check(parse_prj(SPF3D[:-1] + ',LINUNIT["Meter",1.0]]')[3] is True,
+          "a 3D PROJCS with a LINUNIT in its GEOGCS and its root, as Pro writes it, is defined")
+    raises(lambda: parse_prj(SPF[:-1] + ',LINUNIT["Meter",1.0]]'),
+           "a 2D PROJCS with a LINUNIT added is refused, as Pro reads it as Unknown  "
+           "<-- pinned defect", needle="PROJCS LINUNIT needs a GEOGCS")
     for text, label, needle in (
             (WGS84.replace(",DATUM", u",\u00a0DATUM"), "an NBSP after a comma", "verify"),
             (WGS84.replace("DATUM[", u"DATUM\u00a0["), "an NBSP before a bracket", "verify"),
@@ -2091,7 +2114,7 @@ def self_test():
              "a PROJCS with no UNIT of its own", "PROJCS has no UNIT"),
             (SPF.replace('UNIT["Foot_US",0.3048006096012192]', 'UNIT["Foot_US",0.0]'),
              "a PROJCS UNIT factor of 0", "PROJCS UNIT factor is not positive"),
-            (SPF[:-1] + ',LINUNIT["Meter",0.0]]', "a PROJCS LINUNIT factor of 0",
+            (SPF3D[:-1] + ',LINUNIT["Meter",0.0]]', "a PROJCS LINUNIT factor of 0",
              "PROJCS LINUNIT factor"),
             (WGS84.replace('DATUM["D_WGS_1984",', "DATUM["), "a DATUM with no name",
              "DATUM needs a name"),
@@ -2197,6 +2220,12 @@ def self_test():
                    ("BLOB", "M")],
           "dBASE C, N, D, L and F types are named; an unknown letter is kept as-is")
     check(dbf_parse(dbf_bytes([]))[1] == [], "a .dbf with no fields reads as none")
+    check([t for _, t in dbf_parse(dbf_bytes(
+        [("A", "N", 4, 0), ("B", "N", 10, 0), ("C", "N", 11, 0), ("D", "N", 8, 3),
+         ("E", "N", 9, 1), ("F", "F", 13, 3), ("G", "F", 14, 0)]))[1]] ==
+          ["SmallInteger", "Integer", "Double", "Single", "Double", "Single", "Double"],
+          "a numeric .dbf field is named by its width, as Pro 3.6 ListFields names it  "
+          "<-- pinned defect")
     raises(lambda: dbf_parse(b"\x03" * 31), "a .dbf shorter than 32 bytes is refused",
            needle="31 bytes")
     raises(lambda: dbf_parse(dbf_bytes(FIELDS[:1], terminator=b"")),
@@ -2828,6 +2857,17 @@ def self_test():
         rc, out = run_check("--source", shapefile("empty", records=0))
         check(rc == 2 and "holds no features" in out and "100-byte header" in out,
               "check refuses an empty shapefile  <-- pinned defect")
+        shapefile("norows", fields=None)
+        put("norows.dbf", dbf_bytes(FIELDS[:2], records=0))
+        rc, out = run_check("--source", os.path.join(tmp, "norows.shp"))
+        check(rc == 2 and "the .dbf holds 0 records" in out,
+              "check refuses 3 shapes over a .dbf of 0 records, as import refuses GetCount 0  "
+              "<-- pinned defect")
+        rc, out = run_check("--source", shapefile("wide", fields=[("N1", "N", 18, 0)]),
+                            "--target", shapefile("narrow", fields=[("N1", "N", 4, 0)]))
+        check(rc == 0 and "! N1: source Double vs target SmallInteger" in out,
+              "check --target reports N(18,0) against N(4,0) as a type conflict  "
+              "<-- pinned defect")
         rc, out = run_check("--source", shapefile("nulls", shape_type=0))
         check(rc == 2 and "shape type 0, Null" in out,
               "check refuses a shapefile of Null shapes")
