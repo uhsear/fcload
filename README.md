@@ -125,7 +125,7 @@ PASS  a non-ASCII .prj name is printed escaped on a cp1252 pipe, no crash  <-- p
 PASS  check refuses a .dbf that claims 0 records over 3, never 'rows: 0' and ACCEPT  <-- pinned defect
 ...
 --------------------------------------------------------------------
-462 assertions, 0 failed
+463 assertions, 0 failed
 ```
 
 ## Requirements
@@ -145,8 +145,8 @@ inside `_arcpy()`, which only the geodatabase functions call. A missing arcpy pr
 The self-test asserts that importing `fcload` does not import arcpy, and it runs `check` with
 arcpy made unimportable.
 
-The same 462 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3).
-The Windows and Ubuntu outputs are identical line for line, apart from Windows line endings.
+463 assertions pass on Windows (Python 3.13.2). The Python 3.9.25 and Ubuntu 3.12.3 runs predate this change and are not repeated.
+Before this change, the Windows and Ubuntu outputs were identical line for line, apart from Windows line endings.
 
 fcload writes only ASCII to stdout. A `.prj` or `.dbf` can hold any byte, and a Windows pipe or
 log file is cp1252, so a raw CJK name or a C1 byte would crash the run halfway through its

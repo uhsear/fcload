@@ -917,6 +917,7 @@ def build_parser():
         description="Load a dataset into a geodatabase, refusing the imports that corrupt silently.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("USAGE\n-----\n", 1)[-1],
+        allow_abbrev=False,
     )
     p.add_argument("command", nargs="?", choices=("import", "chores", "diff", "check"),
                    help="import | chores | diff | check (check needs no arcpy)")
@@ -2314,6 +2315,14 @@ def self_test():
 
     ns = p.parse_args(["import", "--source", "a.shp", "--workspace", "w.gdb", "--apply"])
     check(ns.apply is True, "--apply turns on when asked")
+    refused = False
+    try:
+        with redirect_stderr(io.StringIO()):
+            p.parse_args(["import", "--source", "a.shp", "--workspace", "w.gdb", "--ap"])
+    except SystemExit:
+        refused = True
+    check(refused, "a unique prefix of --apply (--ap) is refused, never read as --apply  "
+          "<-- pinned defect")
 
     check(validate_args(p.parse_args(["import", "--workspace", "w.gdb"])),
           "import without --source is rejected")
