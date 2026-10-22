@@ -6,7 +6,8 @@ WHAT IS NEW HERE (one claim only)
 ---------------------------------
 Every step this tool performs is arcpy: FeatureClassToFeatureClass, Append, AddField,
 ListFields, AddGlobalIDs, EnableEditorTracking, Describe. The novelty is the refusal
-gate in front of them.
+gate in front of them. Version 1.2.0 adds a warning when an import drops attachments,
+and `loadscar`, which runs the same rules on a shapefile somebody delivered.
 
 arcpy will happily import a source whose spatial reference is UNDEFINED (factoryCode 0,
 name "Unknown" - e.g. a shapefile whose .prj was lost) at maxSeverity 0, with zero
@@ -54,6 +55,25 @@ REFUSALS (fcload stops instead of importing)
    not WKT is refused without echoing its text, and a header error names bytes, not
    their values.
 
+WARNINGS (fcload loads, and says what it saw)
+---------------------------------------------
+A. `import` of a source with attachments. With arcpy.env.maintainAttachments False the
+   tools copy the features and drop every attachment at maxSeverity 0, with no warning
+   (measured on Pro 3.6). fcload prints WARNING before the load when the setting is False,
+   and after --apply it counts the attachment rows in the target and warns when they are
+   fewer than the source's plus what the target already held. A warning does not change
+   the exit code: a load that dropped attachments still exits 0.
+
+LOADSCAR (the refusal rules run backwards on a delivered file)
+--------------------------------------------------------------
+`loadscar --source D.shp [--target FIELDS.txt]` reads a shapefile somebody delivered and
+looks for what a write leaves behind when it eats data: no .prj, a .prj that
+contradicts the extent, a .shx and .dbf that disagree about the number of features, a
+text field with values that fill its 254 characters, and, given a text file of the
+original's field names, names cut to 10 characters and fields that are gone. Losses that
+leave no trace (the time of a date, a null written as 0, digits past the twelfth of a
+Double) are named as notes. It is read-only and needs no arcpy. It exits 2 on a scar.
+
 VERSIONING (ERROR 001332)
 -------------------------
 Versioning cannot be registered on an individual feature class that lives inside a
@@ -66,6 +86,7 @@ USAGE
 -----
     python fcload.py --self-test                     # offline, no arcpy, no network
     python fcload.py check   --source S.shp [--target T.shp]          # no arcpy, read-only
+    python fcload.py loadscar --source D.shp [--target FIELDS.txt]    # no arcpy, read-only
     python fcload.py import  --source S --workspace W [--dataset D] [--name N] [--apply]
     python fcload.py chores  --workspace W --target T [--apply]
     python fcload.py diff    --source S --workspace W --target T [--add-missing] [--apply]
@@ -89,7 +110,7 @@ import re
 import struct
 import sys
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 ACCEPT = "ACCEPT"
 REFUSE = "REFUSE"
@@ -150,6 +171,12 @@ SHAPE_TYPES = {
     21: "PointM", 23: "PolylineM", 25: "PolygonM", 28: "MultiPointM", 31: "MultiPatch",
 }
 DBF_TYPES = {"C": "String", "D": "Date", "L": "Logical"}
+SHX_HEADER = 100
+SHX_RECORD = 8            # an index record: offset and content length, 4 bytes each
+NAME_CAP = 10             # a shapefile field name holds 10 characters
+TEXT_CAP = 254            # a shapefile text field holds 254 characters
+UNKNOWN_ROWS = -1         # attachments exist but their table could not be found
+_FIELD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}\Z")
 
 # The leading keyword of a .prj, and one WKT token: a bracket or comma, a quoted string,
 # or a bare word (a keyword, a number, or an AXIS direction such as NORTH).
@@ -860,6 +887,183 @@ def parse_dbf_fields(data, size):
     return count, fields
 
 
+def attachment_plan(rows, maintain):
+    """What to tell the operator before a load, when the source has attachments.
+
+    rows: the rows in the source's attachment table, or UNKNOWN_ROWS when that table
+    could not be found. maintain: arcpy.env.maintainAttachments. Returns a list of
+    (level, text), level "info" or "warning". Pure.
+    """
+    what = ("an unknown number of attachment rows" if rows < 0
+            else "%d attachment row%s" % (rows, "" if rows == 1 else "s"))
+    if maintain:
+        return [("info", "%s in the source; arcpy.env.maintainAttachments is True, so the "
+                         "load copies them (checked after --apply)" % what)]
+    return [("warning", "%s in the source will be DROPPED: arcpy.env.maintainAttachments is "
+                        "False, and Pro 3.6 then copies the features at maxSeverity 0 with "
+                        "no warning" % what),
+            ("warning", "set arcpy.env.maintainAttachments = True in the session or the "
+                        "project's environment settings, then run fcload again")]
+
+
+def attachment_loss(source_rows, before_rows, after_rows):
+    """The message for a load that left attachments behind, or None when none were lost.
+
+    source_rows: the source's attachment rows, UNKNOWN_ROWS when not countable.
+    before_rows: attachment rows the target already held (0 for a new target).
+    after_rows : attachment rows the target holds now, None when it has no attachment
+    table at all. Pure.
+    """
+    if source_rows == 0:
+        return None
+    if source_rows < 0:
+        if after_rows is None:
+            return "the source has attachments and the target has no attachment table"
+        return None
+    expected = before_rows + source_rows
+    if after_rows is None or after_rows < expected:
+        return ("attachments dropped: the target should hold %d attachment rows (%d already "
+                "there + %d from the source) and holds %d"
+                % (expected, before_rows, source_rows, after_rows or 0))
+    return None
+
+
+def dbf_layout(data):
+    """[(name, letter, width, offset)] of a .dbf header that parse_dbf_fields accepted,
+    with `offset` the column's first byte inside a record (the deletion flag is byte 0),
+    and the header length and record length. Pure."""
+    header_len, record_len = struct.unpack("<HH", data[8:12])
+    columns = []
+    offset = 1
+    pos = 32
+    while data[pos:pos + 1] != b"\r":
+        desc = data[pos:pos + 32]
+        name = desc[:11].split(b"\0", 1)[0].decode("ascii", "backslashreplace").strip()
+        columns.append((name, desc[11:12].decode("latin-1"), desc[16], offset))
+        offset += desc[16]
+        pos += 32
+    return columns, header_len, record_len
+
+
+def text_cap_hits(chunk, record_len, last_bytes):
+    """Per column, how many whole records in `chunk` have a byte that is not blank at the
+    column's last byte (`last_bytes`, offsets inside a record). A text value that fills a
+    field to its last byte is a value that fits exactly or one that was cut. Pure."""
+    hits = []
+    for at in last_bytes:
+        column = chunk[at::record_len]
+        hits.append(len(column) - column.count(b" ") - column.count(b"\0"))
+    return hits
+
+
+def _cut_form(original, delivered):
+    """True when `delivered` is how a shapefile writer spells `original` under the
+    10-character limit: the first 10 characters, or a shorter stem and _N that make 10.
+    Measured on Pro 3.6: PARCEL_NUMBER_2 became PARCEL_N_1 beside PARCEL_NUM."""
+    o, d = original.lower(), delivered.lower()
+    if len(o) <= NAME_CAP or len(d) != NAME_CAP:
+        return False
+    stem, sep, num = d.rpartition("_")
+    return o.startswith(d) or bool(sep and num.isdigit() and o.startswith(stem))
+
+
+def field_scars(original, delivered):
+    """Fields the write ate, from the original's names and the delivered file's names.
+
+    Both are lists of names. Geodatabase-managed fields are ignored on both sides. A name
+    the delivered file lacks is paired with a delivered name nobody else claimed when that
+    name is the 10-character form of it, else it is reported as having no counterpart.
+    Returns a list of messages. Pure.
+    """
+    orig = [n for n in original if n.lower() not in SYSTEM_FIELDS]
+    deliv = [n for n in delivered if n.lower() not in SYSTEM_FIELDS]
+    have = set(n.lower() for n in orig)
+    left = [d for d in deliv if d.lower() not in have]
+    got = set(d.lower() for d in deliv)
+    out = []
+    for o in orig:
+        if o.lower() in got:
+            continue
+        cut = next((d for d in left if _cut_form(o, d)), None)
+        if cut is None:
+            out.append("field %s has no counterpart in the delivered file" % o)
+        else:
+            left.remove(cut)
+            out.append("field %s was cut to %s by the %d-character limit"
+                       % (o, cut, NAME_CAP))
+    return out
+
+
+def scar_report(fields, shapes, rows, full, original):
+    """The scars and notes for a delivered shapefile. Pure: plain data in, text out.
+
+    fields  : [(name, type)] read from the .dbf, types as parse_dbf_fields names them
+    shapes  : shapes the .shx indexes, None when there is no .shx
+    rows    : records the .dbf holds
+    full    : {text field name: values that fill its last byte}, 254-wide fields only
+    original: the original's field names, or None when the operator gave none
+
+    A scar is evidence that the write lost data. A note is a loss that leaves no trace in
+    the file, so it can only be named. Returns (scars, notes).
+    """
+    scars = []
+    notes = []
+    if shapes is not None and shapes != rows:
+        scars.append("the .shx indexes %d shape%s and the .dbf holds %d record%s: the two "
+                     "files disagree about how many features the file holds"
+                     % (shapes, "" if shapes == 1 else "s", rows, "" if rows == 1 else "s"))
+    for name, n in sorted(full.items()):
+        scars.append("%d value%s of %s fill%s all %d characters, the most a shapefile text "
+                     "field holds: a longer original was cut here"
+                     % (n, "" if n == 1 else "s", name, "s" if n == 1 else "", TEXT_CAP))
+    names = [n for n, _ in fields]
+    if original is not None:
+        scars.extend(field_scars(original, names))
+    else:
+        tens = [n for n in names if len(n) == NAME_CAP]
+        if tens:
+            notes.append("%s %s exactly %d characters, the longest name a shapefile holds: "
+                         "a longer name in the original would be cut to this. Compare with "
+                         "--target FIELDS.txt" % (", ".join(tens), "is" if len(tens) == 1
+                                                 else "are", NAME_CAP))
+    dates = [n for n, t in fields if t == "Date"]
+    if dates:
+        notes.append("%s: a shapefile date holds the day only, so a time of day in the "
+                     "original is gone and leaves no trace" % ", ".join(dates))
+    numbers = [n for n, t in fields if t in ("Double", "Single", "Integer", "SmallInteger")]
+    if numbers:
+        notes.append("%s: a null in the original is written as 0 or a sentinel number, and "
+                     "as a space in a text field, so a 0 here may be a null"
+                     % ", ".join(numbers))
+    if any(t == "Double" for _, t in fields):
+        notes.append("a Double is written with 12 significant digits by Pro 3.6, so digits "
+                     "past the twelfth are gone")
+    return scars, notes
+
+
+def read_original_fields(path):
+    """The field names in a loadscar --target file: one per line, blank lines and lines
+    that start with # ignored. Raises ValueError for a line that is not a field name, and
+    does not echo it: the operator may have pointed this at a password file."""
+    try:
+        if os.path.isfile(path):
+            _refuse_link(path)
+        text = _read(path, 1 << 20).decode("utf-8", "replace")
+    except OSError as exc:
+        raise SystemExit("--target %s: cannot be read: %s" % (path, exc))
+    names = []
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not _FIELD_NAME.match(line):
+            raise ValueError("--target %s: line %d is not a field name (letters, "
+                             "digits and underscores, starting with a letter): not echoed"
+                             % (path, number))
+        names.append(line)
+    return names
+
+
 def validate_args(ns):
     """Reject impossible flag combinations. Returns a list of error strings."""
     errors = []
@@ -882,13 +1086,13 @@ def validate_args(ns):
             errors.append("diff requires --workspace")
         if not ns.target:
             errors.append("diff requires --target (the feature class to compare against)")
-    elif cmd == "check":
+    elif cmd in ("check", "loadscar"):
         if not ns.source:
-            errors.append("check requires --source (a .shp file)")
+            errors.append("%s requires --source (a .shp file)" % cmd)
         if ns.apply:
-            errors.append("check is read-only: --apply has nothing to apply")
+            errors.append("%s is read-only: --apply has nothing to apply" % cmd)
         if ns.check_write:
-            errors.append("--check-write probes a workspace, and check has none")
+            errors.append("--check-write probes a workspace, and %s has none" % cmd)
 
     if ns.add_missing and cmd != "diff":
         errors.append("--add-missing applies to the 'diff' subcommand only")
@@ -896,8 +1100,8 @@ def validate_args(ns):
         errors.append("--assume-sr applies to the 'import' subcommand only")
     if ns.assume_sr is not None and int(ns.assume_sr) <= 0:
         errors.append("--assume-sr must be a positive WKID (0 is the undefined case)")
-    if ns.check_write and not ns.apply and cmd != "check":
-        # check has its own refusal above; --apply would not cure it, so do not say it would.
+    if ns.check_write and not ns.apply and cmd not in ("check", "loadscar"):
+        # check and loadscar have their own refusal above; --apply would not cure it.
         errors.append(CHECK_WRITE_REFUSAL)
 
     return errors
@@ -919,12 +1123,16 @@ def build_parser():
         epilog=__doc__.split("USAGE\n-----\n", 1)[-1],
         allow_abbrev=False,
     )
-    p.add_argument("command", nargs="?", choices=("import", "chores", "diff", "check"),
-                   help="import | chores | diff | check (check needs no arcpy)")
+    p.add_argument("command", nargs="?",
+                   choices=("import", "chores", "diff", "check", "loadscar"),
+                   help="import | chores | diff | check | loadscar (check and loadscar "
+                        "need no arcpy)")
     p.add_argument("--workspace", help="Target geodatabase (.gdb or .sde connection file)")
-    p.add_argument("--source", help="Source feature class or shapefile (check: a .shp)")
+    p.add_argument("--source", help="Source feature class or shapefile (check: a .shp; loadscar: "
+                                     "the delivered .shp)")
     p.add_argument("--target", help="Target feature class name inside the workspace "
-                                    "(check: a second .shp to compare with)")
+                                    "(check: a second .shp to compare with; loadscar: "
+                                    "a text file of the original's field names)")
     p.add_argument("--dataset", help="Target feature dataset inside the workspace")
     p.add_argument("--name", help="Output feature class name (default: the source name)")
     p.add_argument("--assume-sr", type=int, default=None, metavar="WKID",
@@ -958,35 +1166,56 @@ def _read(path, limit):
         return f.read(limit)
 
 
-def read_shapefile(path, label):
-    """The .shp header, .prj and .dbf header of one shapefile. Opens files 'rb' only."""
+def _refuse_link(f):
+    """Raise ValueError when `f` is a symbolic link or has a second hard link.
+
+    unzip restores a symbolic link from an archive, and tar a hard link to a file already
+    in the folder. A linked file is not read, wherever it points: `parcels.dbf -> .token`
+    in the same folder would print parts of the token. A hard link is a second name with
+    st_nlink > 1; os.link needs no admin on Windows.
+    """
+    if os.path.islink(f) or os.stat(f).st_nlink > 1:
+        raise ValueError("%s is a link, so it is not read: it could point at any file, "
+                         "such as ~/.pgpass" % os.path.basename(f))
+
+
+def read_shapefile(path, label, want_shx=False):
+    """The .shp header, .prj and .dbf header of one shapefile. Opens files 'rb' only.
+
+    With want_shx the .shx is read too, for the shape count it indexes (loadscar)."""
     base, ext = os.path.splitext(path)
     if ext.lower() != ".shp" or not os.path.isfile(path):
         raise SystemExit("%s not found or not a .shp file: %s" % (label, path))
     prj = _sibling(base, ".prj")
     dbf = _sibling(base, ".dbf")
+    shx = _sibling(base, ".shx") if want_shx else None
     try:
-        # unzip restores a symbolic link from an archive, and tar a hard link to a file
-        # already in the folder. A linked .shp, .prj or .dbf is not read, wherever it
-        # points: `parcels.dbf -> .token` in the same folder would print parts of the token.
-        # A hard link is a second name with st_nlink > 1; os.link needs no admin on Windows.
-        for f in (path, prj, dbf):
-            if f and (os.path.islink(f) or os.stat(f).st_nlink > 1):
-                raise ValueError("%s is a link, so it is not read: it could point at any "
-                                 "file, such as ~/.pgpass" % os.path.basename(f))
+        for f in (path, prj, dbf, shx):
+            if f:
+                _refuse_link(f)
         shape_type, bbox, empty = parse_shp_header(_read(path, SHP_HEADER),
                                                    os.path.getsize(path))
         prj_text = _read(prj, 65536).decode("utf-8", "replace") if prj else ""
         wkid, kind, name, defined = parse_prj(prj_text)
-        rows, fields = (parse_dbf_fields(_read(dbf, 65536), os.path.getsize(dbf)) if dbf
+        dbf_head = _read(dbf, 65536) if dbf else None
+        rows, fields = (parse_dbf_fields(dbf_head, os.path.getsize(dbf)) if dbf
                         else (None, None))
+        shapes = None
+        if shx:
+            size = os.path.getsize(shx)
+            parse_shp_header(_read(shx, SHX_HEADER), size)
+            if (size - SHX_HEADER) % SHX_RECORD:
+                raise ValueError("the .shx is not %d bytes plus %d for each shape: "
+                                 "truncated or corrupt" % (SHX_HEADER, SHX_RECORD))
+            shapes = (size - SHX_HEADER) // SHX_RECORD
     except ValueError as exc:
         raise ValueError("%s %s: %s" % (label, path, exc))
     except OSError as exc:
         raise SystemExit("%s %s: cannot be read: %s" % (label, path, exc))
     return {"path": path, "shape_type": shape_type, "bbox": bbox, "empty": empty,
             "prj": prj, "wkid": wkid, "sr_type": kind, "sr_name": name,
-            "defined": defined, "dbf": dbf, "rows": rows, "fields": fields}
+            "defined": defined, "dbf": dbf, "rows": rows, "fields": fields,
+            "dbf_head": dbf_head, "shx": shx, "shapes": shapes}
 
 
 def _print_field_diff(missing_t, missing_s, conflicts):
@@ -1001,17 +1230,9 @@ def _print_field_diff(missing_t, missing_s, conflicts):
         print("    ! %s: source %s vs target %s" % (n, st, tt))
 
 
-def cmd_check(ns):
-    print("fcload check (read-only, arcpy is not imported)")
-    try:
-        src = read_shapefile(ns.source, "source")
-        tgt = read_shapefile(ns.target, "target") if ns.target else None
-    except ValueError as exc:
-        print("  verdict    : REFUSE")
-        print("    - %s" % exc)
-        return 2
-
-    print("  source     : %s" % src["path"])
+def _print_summary(src, label):
+    """The lines `check` and `loadscar` share. `label` is 9 characters wide."""
+    print("  %s  : %s" % (label, src["path"]))
     print("  geometry   : %s   rows: %s   fields: %s" % (
         SHAPE_TYPES[src["shape_type"]],
         "unknown (no .dbf)" if src["rows"] is None else src["rows"],
@@ -1022,6 +1243,19 @@ def cmd_check(ns):
                                           _wkid_text(src["wkid"]),
                                           src["sr_type"] or "type unknown"))
     print("  extent     : %s   (.shp header, bytes 36-67)" % (src["bbox"],))
+
+
+def cmd_check(ns):
+    print("fcload check (read-only, arcpy is not imported)")
+    try:
+        src = read_shapefile(ns.source, "source")
+        tgt = read_shapefile(ns.target, "target") if ns.target else None
+    except ValueError as exc:
+        print("  verdict    : REFUSE")
+        print("    - %s" % exc)
+        return 2
+
+    _print_summary(src, "source   ")
 
     if src["empty"] or src["shape_type"] == 0 or src["rows"] == 0:
         print("  verdict    : REFUSE")
@@ -1063,6 +1297,78 @@ def cmd_check(ns):
     return 2 if verdict == REFUSE else 0
 
 
+def scan_text_caps(path, header_len, record_len, count, last_bytes):
+    """text_cap_hits over every record of a .dbf, read in chunks. Read-only."""
+    totals = [0] * len(last_bytes)
+    step = max(1, (1 << 22) // record_len)
+    with open(path, "rb") as f:
+        f.seek(header_len)
+        left = count
+        while left:
+            take = min(step, left)
+            chunk = f.read(take * record_len)
+            totals = [a + b for a, b in zip(totals, text_cap_hits(chunk, record_len,
+                                                                  last_bytes))]
+            left -= take
+    return totals
+
+
+def cmd_loadscar(ns):
+    """fcload's refusal rules run backwards on a file somebody delivered: what in the file
+    shows that the write which made it lost data. Read-only, no arcpy."""
+    print("fcload loadscar (read-only, arcpy is not imported)")
+    try:
+        src = read_shapefile(ns.source, "delivered", want_shx=True)
+        original = read_original_fields(ns.target) if ns.target else None
+    except ValueError as exc:
+        print("  verdict    : REFUSE")
+        print("    - %s" % exc)
+        return 2
+
+    _print_summary(src, "delivered")
+    scars = []
+    notes = []
+    for ext, found in ((".dbf", src["dbf"]), (".shx", src["shx"])):
+        if not found:
+            scars.append("no %s beside the .shp: the shapefile specification requires it, so "
+                         "part of the delivery is missing" % ext)
+    blank = src["empty"] or src["shape_type"] == 0 or src["rows"] == 0
+    if blank:
+        scars.append("the delivered file holds no features (%s)" % (
+            "the .shp is its 100-byte header alone" if src["empty"] else
+            "shape type 0, Null" if src["shape_type"] == 0 else "the .dbf holds 0 records"))
+    elif src["dbf"]:
+        columns, header_len, record_len = dbf_layout(src["dbf_head"])
+        wide = [c for c in columns if c[1] == "C" and c[2] == TEXT_CAP]
+        hits = []
+        if wide:
+            try:
+                hits = scan_text_caps(src["dbf"], header_len, record_len, src["rows"],
+                                      [off + width - 1 for _, _, width, off in wide])
+            except OSError as exc:
+                raise SystemExit("delivered %s: cannot be read: %s" % (src["path"], exc))
+        found, notes = scar_report(src["fields"], src["shapes"], src["rows"],
+                                   dict((c[0], n) for c, n in zip(wide, hits) if n), original)
+        scars.extend(found)
+    if not blank:
+        # An empty file's box says nothing, so its SR is not judged against it.
+        verdict, reasons = sr_verdict(src["wkid"], src["sr_type"], src["sr_name"],
+                                      src["bbox"], None, prj_defined=src["defined"])
+        if verdict == REFUSE:
+            scars.extend(reasons)
+    print("  shapes     : %s in the .shx, %s in the .dbf" % (
+        "unknown" if src["shapes"] is None else src["shapes"],
+        "unknown" if src["rows"] is None else src["rows"]))
+    print("  verdict    : %s" % (REFUSE if scars else ACCEPT))
+    for x in scars or ["no scar found by these rules (see Limitations: absence is not proof)"]:
+        print("    - %s" % x)
+    if notes:
+        print("  losses that leave no trace (named, not detected):")
+        for x in notes:
+            print("    - %s" % x)
+    return 2 if scars else 0
+
+
 # --------------------------------------------------------------------------- #
 # arcpy-backed description and actions
 # --------------------------------------------------------------------------- #
@@ -1072,6 +1378,33 @@ def _sr_fields(sr):
         return 0, "", "Unknown"
     return (int(getattr(sr, "factoryCode", 0) or 0), getattr(sr, "type", ""),
             getattr(sr, "name", "Unknown"))
+
+
+def attachment_rows(arcpy, path):
+    """None when `path` has no attachments, else the rows in its attachment table, or
+    UNKNOWN_ROWS when that table cannot be found. Reads only.
+
+    A feature class lists its relationship classes; the one whose isAttachmentRelationship
+    is True names the attachment table as its destination. Measured on Pro 3.6, a feature
+    class inside a feature dataset keeps that class and table at the workspace root, so the
+    search climbs from the path to its two nearest parents.
+    """
+    base = os.path.basename(path).lower()
+    here = path
+    for rel in getattr(arcpy.Describe(path), "relationshipClassNames", None) or []:
+        for _ in range(2):
+            here = os.path.dirname(here)
+            rel_path = os.path.join(here, rel)
+            if not arcpy.Exists(rel_path):
+                continue
+            rd = arcpy.Describe(rel_path)
+            if (getattr(rd, "isAttachmentRelationship", False)
+                    and base in [n.lower() for n in rd.originClassNames]):
+                table = os.path.join(here, rd.destinationClassNames[0])
+                return (int(arcpy.management.GetCount(table)[0]) if arcpy.Exists(table)
+                        else UNKNOWN_ROWS)
+        here = path
+    return None
 
 
 def describe_source(path):
@@ -1095,6 +1428,7 @@ def describe_source(path):
         "extent": extent,
         "count": int(arcpy.management.GetCount(path)[0]),
         "fields": [(f.name, f.type, f.length) for f in arcpy.ListFields(path)],
+        "attach": attachment_rows(arcpy, path),
     }
 
 
@@ -1164,6 +1498,10 @@ def cmd_import(ns):
         src["sr_name"], src["wkid"], src["sr_type"] or "type unknown"))
     print("  extent     : %s" % (src["extent"],))
     print("  target     : %s -> %s  (WKID %d)" % (out_path, out_name, target_wkid))
+    if src["attach"] is not None:
+        maintain = bool(getattr(arcpy.env, "maintainAttachments", True))
+        for level, text in attachment_plan(src["attach"], maintain):
+            print("  %s: %s" % ("attachments" if level == "info" else "WARNING    ", text))
 
     if src["count"] == 0:
         print("  verdict    : REFUSE")
@@ -1215,6 +1553,7 @@ def cmd_import(ns):
 
     existed = arcpy.Exists(dest)
     before = int(arcpy.management.GetCount(dest)[0]) if existed else 0
+    before_att = max(attachment_rows(arcpy, dest) or 0, 0) if existed else 0
 
     if existed:
         print("  target exists: appending %d rows with Append (NO_TEST)" % src["count"])
@@ -1237,6 +1576,18 @@ def cmd_import(ns):
     if after != expected:
         print("  FAILED: row count mismatch. Treat this load as incomplete.")
         return 1
+
+    if src["attach"] is not None:
+        after_att = attachment_rows(arcpy, dest)
+        if after_att == UNKNOWN_ROWS:
+            lost = ("attachments not verified: the target's attachment table could not be "
+                    "found to count")
+        else:
+            lost = attachment_loss(src["attach"], before_att, after_att)
+        if lost:
+            print("  WARNING    : %s" % lost)
+        else:
+            print("  attachments: %d attachment rows now in the target" % (after_att or 0))
 
     d = arcpy.Describe(dest)
     print("  OK: %s | %s | SR %r (WKID %s)" % (
@@ -1393,26 +1744,56 @@ class _StubArcpy(object):
         self.add_field_works = g("add_field_works", True)
         self.management = _StubGroup(self)
         self.conversion = _StubGroup(self)
-        self.env = _Stub(scratchGDB="scratch.gdb")
+        self.maintain = g("maintain", True)
+        self.env = _Stub(scratchGDB="scratch.gdb", maintainAttachments=self.maintain)
         self.dest_path = g("dest_path", os.path.join(self.WS, self.DS, "out"))
+        # Attachments: None is "none", a number is the rows in the attachment table.
+        self.src_attach = g("src_attach")
+        self.dest_attach = g("dest_attach")
+        self.attach_copies = g("attach_copies", self.maintain)
+        self.table_missing = g("table_missing", False)
+        self.rel_attach = g("rel_attach", True)         # False: a plain relationship class
+        self.rel_origin = g("rel_origin")               # override the origin class name
+        self.extra_rel = g("extra_rel", False)          # a first relationship class that is not there
+        self.rels = {
+            "src__ATTACHREL": _Stub(isAttachmentRelationship=self.rel_attach,
+                                    originClassNames=[self.rel_origin or self.SRC],
+                                    destinationClassNames=["src__ATTACH"]),
+            os.path.join(self.WS, "out__ATTACHREL"): _Stub(
+                isAttachmentRelationship=self.rel_attach,
+                originClassNames=[self.rel_origin or "OUT"],
+                destinationClassNames=["out__ATTACH"]),
+        }
 
     # --- the arcpy surface fcload touches ----------------------------------- #
     def Exists(self, path):
         self.calls.append(("Exists", path, {}))
         if path in self.missing:
             return False
+        if path.endswith("REL"):
+            return path in self.rels
+        if path.endswith("__ATTACH"):
+            return not self.table_missing
         return self.dest_exists if path == self.dest_path else True
 
     def Describe(self, path):
+        if path in self.rels:
+            return self.rels[path]
+        extra = ["gone__REL"] if self.extra_rel else []
         if path == self.SRC:
             ext = None if self.src_extent is None else _Stub(
                 XMin=self.src_extent[0], YMin=self.src_extent[1],
                 XMax=self.src_extent[2], YMax=self.src_extent[3])
-            return _Stub(spatialReference=self.src_sr, extent=ext,
-                         baseName="out", shapeType="Point")
+            d = _Stub(spatialReference=self.src_sr, extent=ext,
+                      baseName="out", shapeType="Point")
+            if self.src_attach is not None:     # a shapefile has no such property at all
+                d.relationshipClassNames = extra + ["src__ATTACHREL"]
+            return d
         return _Stub(spatialReference=self.tgt_sr, extent=None, baseName="out",
                      shapeType="Point", hasGlobalID=self.has_gid,
-                     editorTrackingEnabled=self.tracking)
+                     editorTrackingEnabled=self.tracking,
+                     relationshipClassNames=extra + (
+                         [] if self.dest_attach is None else ["out__ATTACHREL"]))
 
     def ListFields(self, path):
         rows = self.src_fields if path == self.SRC else self.dest_fields
@@ -1429,11 +1810,15 @@ class _StubArcpy(object):
         self.calls.append((name, args, kwargs))
         if name == "GetCount":
             path = args[0] if args else kwargs.get("in_rows")
+            if path.endswith("__ATTACH"):
+                return [str(self.src_attach if path == "src__ATTACH" else self.dest_attach)]
             return [str(self.src_count if path == self.SRC else self.dest_count)]
         if name in ("FeatureClassToFeatureClass", "Append"):
             before = self.dest_count if self.dest_exists else 0
             self.dest_count = (before + self.src_count) if self.landed is None else self.landed
             self.dest_exists = True
+            if self.src_attach is not None and self.attach_copies:
+                self.dest_attach = (self.dest_attach or 0) + max(self.src_attach, 0)
         elif name == "AddGlobalIDs":
             self.has_gid = True
         elif name == "EnableEditorTracking":
@@ -1776,22 +2161,28 @@ def self_test():
 
     # --- the three header parsers `check` relies on -------------------------- #
     def shp_bytes(shape_type=1, bbox=DEG, records=3, code=SHP_FILE_CODE,
-                  version=SHP_VERSION, declare_extra=0):
-        body = b"\0" * (28 * records)      # 8-byte record header + 20-byte point, unread
+                  version=SHP_VERSION, declare_extra=0, record_size=28):
+        # 28: an 8-byte record header + a 20-byte point, unread. A .shx record is 8.
+        body = b"\0" * (record_size * records)
         words = (SHP_HEADER + len(body) + declare_extra) // 2
         head = struct.pack(">7i", code, 0, 0, 0, 0, 0, words)
         head += struct.pack("<2i8d", version, shape_type, bbox[0], bbox[1], bbox[2],
                             bbox[3], 0.0, 0.0, 0.0, 0.0)
         return head + body
 
-    def dbf_bytes(fields, records=3, terminator=b"\r"):
+    def dbf_bytes(fields, records=3, terminator=b"\r", rows=None):
         desc = b"".join(struct.pack("<11sc4xBB14x",
                                     n if isinstance(n, bytes) else n.encode("ascii"),
                                     t.encode("ascii"), ln, dec) for n, t, ln, dec in fields)
         head_len = 32 + len(desc) + len(terminator)
         rec_len = 1 + sum(f[2] for f in fields)
         head = struct.pack("<4BIHH20x", 3, 126, 9, 26, records, head_len, rec_len)
-        return head + desc + terminator + b" " * (rec_len * records) + b"\x1a"
+        if rows is not None:        # rows: one list of byte values per record
+            body = b"".join(b" " + b"".join(v.ljust(f[2]) for v, f in zip(row, fields))
+                            for row in rows)
+        else:
+            body = b" " * (rec_len * records)
+        return head + desc + terminator + body + b"\x1a"
 
     def dbf_parse(data):
         return parse_dbf_fields(data, len(data))
@@ -2324,6 +2715,28 @@ def self_test():
     check(refused, "a unique prefix of --apply (--ap) is refused, never read as --apply  "
           "<-- pinned defect")
 
+    for prefix in ("--ap", "--app", "--tar"):
+        refused = False
+        try:
+            with redirect_stderr(io.StringIO()):
+                p.parse_args(["loadscar", "--source", "a.shp", prefix])
+        except SystemExit:
+            refused = True
+        check(refused, "loadscar refuses the prefix %s of a flag  <-- pinned defect" % prefix)
+    check(validate_args(p.parse_args(["loadscar", "--source", "d.shp"])) == []
+          and validate_args(p.parse_args(["loadscar", "--source", "d.shp", "--target",
+                                          "f.txt"])) == [],
+          "loadscar validates clean with a delivered file, and with a file of names")
+    check(validate_args(p.parse_args(["loadscar"])) ==
+          ["loadscar requires --source (a .shp file)"], "loadscar without --source is rejected")
+    check(validate_args(p.parse_args(["loadscar", "--source", "d.shp", "--apply"])) ==
+          ["loadscar is read-only: --apply has nothing to apply"],
+          "loadscar --apply is rejected: it only reads")
+    check(validate_args(p.parse_args(["loadscar", "--source", "d.shp", "--check-write"])) ==
+          ["--check-write probes a workspace, and loadscar has none"],
+          "loadscar --check-write gives one error, never the advice to add --apply  "
+          "<-- pinned defect")
+
     check(validate_args(p.parse_args(["import", "--workspace", "w.gdb"])),
           "import without --source is rejected")
     check(validate_args(p.parse_args(["import", "--source", "a.shp"])),
@@ -2660,6 +3073,88 @@ def self_test():
     check(mod.__version__ == __version__ and mod.__name__ != "__main__",
           "importing fcload does not import arcpy and does not run the CLI")
 
+    # --- attachments: an import that would drop them says so ----------------- #
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"])
+    check(rc == 0 and "attachments" not in out and "WARNING" not in out,
+          "a source with no attachments prints no attachment line and no warning")
+
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=3)
+    check(rc == 0 and "\n  attachments: 3 attachment rows in the source;" in out
+          and "maintainAttachments is True" in out and "WARNING" not in out,
+          "a source with attachments reports them, and the setting that copies them")
+    check(stub.writes() == [], "reporting attachments in a dry run writes nothing")
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=1)
+    check("1 attachment row in the source" in out, "one attachment row is not '1 rows'")
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=0)
+    check("0 attachment rows in the source" in out and "WARNING" not in out,
+          "attachments enabled with no rows is reported and is not a warning")
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=3, table_missing=True)
+    check("an unknown number of attachment rows in the source" in out,
+          "an attachment table that cannot be found is an unknown count, never 0")
+
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=3, maintain=False)
+    check(rc == 0 and "\n  WARNING    : 3 attachment rows in the source will be DROPPED:" in out
+          and "maxSeverity 0" in out and "= True in the session" in out,
+          "maintainAttachments False warns before the load that the attachments will be "
+          "dropped  <-- pinned defect")
+    check(stub.writes() == [], "and the warning dry run still writes nothing")
+
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3)
+    check(rc == 0 and "\n  attachments: 3 attachment rows now in the target" in out
+          and "WARNING" not in out, "a load that copies the attachments counts them after")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, maintain=False)
+    check(rc == 0 and "\n  WARNING    : attachments dropped: the target should hold 3 "
+          "attachment rows (0 already there + 3 from the source) and holds 0" in out,
+          "a load that drops the attachments says so after, and the row count is still "
+          "right  <-- pinned defect")
+    check("rows: 0 before + 3 loaded = 3 expected, 3 found" in out,
+          "the attachment warning follows the row check, never replaces it")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, attach_copies=False)
+    check(rc == 0 and "attachments dropped" in out and "holds 0" in out,
+          "a load that drops them although the setting is True is caught by the count  "
+          "<-- pinned defect")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, dest_exists=True,
+                        dest_before=5, dest_attach=2)
+    check("5 attachment rows now in the target" in out and "WARNING" not in out,
+          "an append counts the attachment rows the target already held")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, dest_exists=True,
+                        dest_before=5, dest_attach=2, attach_copies=False)
+    check("should hold 5 attachment rows (2 already there + 3 from the source) and holds 2"
+          in out, "an append that drops them is caught against what was already there")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, table_missing=True)
+    check(rc == 0 and "attachments not verified: the target's attachment table could not "
+          "be found to count" in out, "an uncountable target table is not called a success")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, dest_exists=True,
+                        dest_before=5, dest_attach=2, table_missing=True)
+    check("attachments not verified" in out, "and not when the target already held some")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=0)
+    check(rc == 0 and "0 attachment rows now in the target" in out and "WARNING" not in out,
+          "an attachment table with no rows loses nothing")
+    rc, out, stub = run(cmd_import, ["import", "--source", _StubArcpy.SRC, "--workspace",
+                                     _StubArcpy.WS, "--apply"], src_attach=2,
+                        dest_path=os.path.join(_StubArcpy.WS, "out"))
+    check(rc == 0 and "2 attachment rows now in the target" in out,
+          "a target at the workspace root finds its attachment table one level up")
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=3, extra_rel=True)
+    check("3 attachment rows in the source" in out,
+          "an attachment relationship class is found among others")
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=3, rel_attach=False)
+    check("attachment" not in out,
+          "a relationship class that is not an attachment one is not an attachment  "
+          "<-- pinned defect")
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=3, rel_origin="some_other_class")
+    check("attachment" not in out,
+          "the attachment table itself, where the class is the destination, is not "
+          "given attachments  <-- pinned defect")
+    check(attachment_plan(2, True)[0][0] == "info" and len(attachment_plan(2, False)) == 2
+          and all(lv == "warning" for lv, _ in attachment_plan(2, False)),
+          "attachment_plan: True is information, False is two warnings")
+    check([attachment_loss(*a) for a in ((0, 0, None), (3, 0, 3), (3, 2, 5), (-1, 0, 4))]
+          == [None] * 4, "attachment_loss: nothing lost when the target holds what it should")
+    check(all(attachment_loss(*a) for a in ((3, 0, 2), (3, 0, None), (3, 2, 4), (-1, 0, None))),
+          "attachment_loss: one row short, no table, and a table short of its prior rows "
+          "are all losses")
+
     # --- check: stdlib shapefile reading, end to end ------------------------- #
     tmp = tempfile.mkdtemp(prefix="fcload-selftest-")
     try:
@@ -2945,6 +3440,229 @@ def self_test():
                             "--target", shapefile("tgt_empty", records=0))
         check(rc == 0, "an empty TARGET is fine: a fresh schema holds no rows yet")
 
+        # --- loadscar: the rules run backwards on a delivered file ------------- #
+        SCAR_FIELDS = [("PARCEL_NUM", "C", 20, 0), ("NOTES", "C", 254, 0),
+                       ("WHEN_AT", "D", 8, 0), ("AMT", "F", 19, 11), ("CNT", "N", 10, 0)]
+        ROW = [b"A1", b"short", b"20260102", b"1.5", b"5"]
+
+        def delivered(stem, fields=SCAR_FIELDS, records=3, values=None, shapes=None,
+                      prj=WGS84, dbf=True, shx=True, shp_records=None, **shp_kw):
+            n = records if values is None else len(values)
+            path = put(stem + ".shp", shp_bytes(records=n if shp_records is None
+                                                else shp_records, **shp_kw))
+            if shx:
+                put(stem + ".shx", shp_bytes(records=n if shapes is None else shapes,
+                                             record_size=8, **shp_kw))
+            if prj is not None:
+                put(stem + ".prj", prj)
+            if dbf:
+                put(stem + ".dbf", dbf_bytes(fields, records=n, rows=values))
+            return path
+
+        def run_scar(*argv):
+            raw = io.BytesIO()
+            buf = io.TextIOWrapper(raw, encoding="cp1252", newline="\n")
+            with arcpy_module(None), redirect_stdout(buf):
+                rc = main(["loadscar"] + list(argv))
+            buf.flush()
+            return rc, raw.getvalue().decode("ascii")
+
+        sc_clean = delivered("sc_clean", values=[ROW, ROW, ROW])
+        sc_idx = delivered("sc_idx", shapes=2)
+        sc_cut = delivered("sc_cut", values=[ROW, [b"A2", b"x" * 254] + ROW[2:], ROW])
+        sc_cuts = delivered("sc_cuts", values=[[b"A", b"x" * 254] + ROW[2:]] * 2)
+        sc_noprj = delivered("sc_noprj", prj=None)
+        sc_wrong = delivered("sc_wrong", prj=SPF)
+        sc_names = put("sc_names.txt", "# the original schema\nOBJECTID\n\nPARCEL_NUMBER\n"
+                                       "NOTES\nWHEN_AT\nAMT\nCNT\nDROPPED_FIELD\n")
+        secret = put("sc_secret.bin", b"S3cr3tT0ken\x00\x01 host:5432:db:user:S3cr3tPass\n")
+        before_scar = snapshot()
+
+        rc, out = run_scar("--source", sc_clean)
+        check(rc == 0 and "verdict    : ACCEPT" in out and "no scar found by these rules" in out
+              and out.startswith("fcload loadscar (read-only, arcpy is not imported)\n"),
+              "loadscar accepts a delivered file with no scar, and says what that is worth")
+        check("\n  delivered  : " in out and "\n  shapes     : 3 in the .shx, 3 in the .dbf\n"
+              in out, "loadscar prints the delivered file and both counts")
+        check("PARCEL_NUM is exactly 10 characters, the longest name a shapefile holds" in out
+              and "--target FIELDS.txt" in out,
+              "a name of exactly 10 characters is named as possibly cut, with the way to check")
+        check("WHEN_AT: a shapefile date holds the day only" in out
+              and "AMT, CNT: a null in the original is written as 0" in out
+              and "a Double is written with 12 significant digits" in out
+              and "losses that leave no trace (named, not detected):" in out,
+              "the losses that leave no trace are named as notes, not as scars")
+
+        rc, out = run_scar("--source", sc_idx)
+        check(rc == 2 and "the .shx indexes 2 shapes and the .dbf holds 3 records" in out
+              and "verdict    : REFUSE" in out,
+              "a .shx and a .dbf that disagree on the feature count are a scar, exit 2  "
+              "<-- pinned defect")
+        rc, out = run_scar("--source", sc_cut)
+        check(rc == 2 and "1 value of NOTES fills all 254 characters" in out,
+              "one text value that fills all 254 characters is a scar, singular  "
+              "<-- pinned defect")
+        rc, out = run_scar("--source", sc_cuts)
+        check(rc == 2 and "2 values of NOTES fill all 254 characters" in out,
+              "two of them are counted, plural")
+        rc, out = run_scar("--source", sc_noprj)
+        check(rc == 2 and "source spatial reference is UNDEFINED" in out,
+              "a delivered file with no .prj is a scar: the undefined rule run backwards")
+        rc, out = run_scar("--source", sc_wrong)
+        check(rc == 2 and "PROJECTED" in out and "latitude/longitude" in out,
+              "a delivered .prj that contradicts the extent is a scar: rule 3 run backwards")
+
+        rc, out = run_scar("--source", sc_clean, "--target", sc_names)
+        check(rc == 2 and "field PARCEL_NUMBER was cut to PARCEL_NUM by the 10-character limit"
+              in out and "field DROPPED_FIELD has no counterpart in the delivered file" in out
+              and "exactly 10 characters" not in out and "OBJECTID" not in out,
+              "the original's field names find a cut name and a lost field, and the 10-"
+              "character note gives way to them")
+
+        check(snapshot() == before_scar and sorted(os.listdir(tmp)) == sorted(before_scar),
+              "loadscar changes no byte and no timestamp and adds no file")
+
+        rc, out = run_scar("--source", delivered("sc_idx1", values=[ROW], shapes=2))
+        check(rc == 2 and "indexes 2 shapes and the .dbf holds 1 record:" in out,
+              "one record is not '1 records'")
+        rc, out = run_scar("--source", delivered("sc_idx2", shapes=1))
+        check(rc == 2 and "indexes 1 shape and the .dbf holds 3 records:" in out,
+              "one shape is not '1 shapes'")
+
+        for label, kw, text in (
+                ("empty", dict(records=0), "the .shp is its 100-byte header alone"),
+                ("null", dict(shape_type=0), "shape type 0, Null"),
+                ("zero", dict(records=0, shp_records=3, shapes=3), "the .dbf holds 0 records")):
+            rc, out = run_scar("--source", delivered("sc_" + label, **kw))
+            check(rc == 2 and "the delivered file holds no features (%s)" % text in out,
+                  "loadscar refuses a delivered file with no features: %s" % label)
+        rc, out = run_scar("--source", delivered("sc_empty_np", records=0, prj=None))
+        check(rc == 2 and "source spatial reference is UNDEFINED" not in out,
+              "an empty file's extent is not judged against its .prj")
+
+        rc, out = run_scar("--source", delivered("sc_nodbf", dbf=False))
+        check(rc == 2 and "no .dbf beside the .shp: the shapefile specification requires it"
+              in out and "rows: unknown (no .dbf)" in out,
+              "a delivery with no .dbf is a scar")
+        rc, out = run_scar("--source", delivered("sc_noshx", shx=False))
+        check(rc == 2 and "no .shx beside the .shp" in out
+              and "shapes     : unknown in the .shx, 3 in the .dbf" in out
+              and "WHEN_AT: a shapefile date" in out and "indexes" not in out,
+              "a delivery with no .shx is a scar, and its .dbf is still read")
+
+        put("sc_badshx.shx", shp_bytes(records=3, record_size=8) + b"\0\0\0")
+        delivered("sc_badshx", shx=False)
+        rc, out = run_scar("--source", os.path.join(tmp, "sc_badshx.shp"))
+        check(rc == 2 and "the .shx is not 100 bytes plus 8 for each shape" in out,
+              "a .shx that is not 100 bytes plus 8 a shape is refused as corrupt")
+        delivered("sc_codeshx", shx=False)
+        put("sc_codeshx.shx", shp_bytes(records=3, record_size=8, code=1))
+        rc, out = run_scar("--source", os.path.join(tmp, "sc_codeshx.shp"))
+        check(rc == 2 and "9994" in out, "a .shx with the wrong file code is refused")
+        delivered("sc_lnkshx", shx=False)
+        os.link(secret, os.path.join(tmp, "sc_lnkshx.shx"))
+        rc, out = run_scar("--source", os.path.join(tmp, "sc_lnkshx.shp"))
+        check(rc == 2 and "sc_lnkshx.shx is a link, so it is not read" in out
+              and "S3cr3t" not in out,
+              "loadscar refuses a .shx hard linked to a secret and prints no byte of it  "
+              "<-- pinned defect")
+
+        big = [[b"a"]] * 20000
+        big[5] = big[17500] = [b"x" * 254]
+        rc, out = run_scar("--source", delivered("sc_big", fields=[("NOTES", "C", 254, 0)],
+                                                  values=big))
+        check(rc == 2 and "2 values of NOTES fill all 254 characters" in out,
+              "a full value in a later 4 MiB chunk is counted with one in the first  "
+              "<-- pinned defect")
+
+        rc, out = run_scar("--source", delivered("sc_c1", fields=[(b"CAF\x81", "N", 10, 0)],
+                                                  values=[[b"1"]] * 3))
+        check(rc == 0 and "CAF\\x81: a null in the original is written as 0 or a sentinel" in out,
+              "loadscar prints a .dbf name with a C1 byte escaped on a cp1252 pipe")
+
+        real_scan = scan_text_caps
+
+        def broken_scan(*args):
+            raise OSError("stub: the disk went away")
+
+        globals()["scan_text_caps"] = broken_scan
+        try:
+            raises(lambda: run_scar("--source", sc_clean), "a .dbf that cannot be scanned "
+                   "stops with its name", exc_type=SystemExit, needle="cannot be read")
+        finally:
+            globals()["scan_text_caps"] = real_scan
+        rc, out = run_scar("--source", delivered("sc_nowide", fields=SCAR_FIELDS[:1]))
+        check(rc == 0, "a .dbf with no 254-character text field is not scanned at all")
+
+        # --- loadscar: the --target file of original names ----------------------- #
+        rc, out = run_scar("--source", sc_clean, "--target", put("sc_bad.txt", "NOTES\nhost:5432:"
+                                                                  "db:user:S3cr3tPass\n"))
+        check(rc == 2 and "line 2 is not a field name" in out and "S3cr3t" not in out
+              and "NOTES" not in out.split("verdict")[1], "a --target line that is not a field "
+              "name is refused and never echoed  <-- pinned defect")
+        os.link(secret, os.path.join(tmp, "sc_link.txt"))
+        rc, out = run_scar("--source", sc_clean, "--target", os.path.join(tmp, "sc_link.txt"))
+        check(rc == 2 and "sc_link.txt is a link, so it is not read" in out
+              and "S3cr3t" not in out, "a --target file hard linked to a secret is refused  "
+              "<-- pinned defect")
+        raises(lambda: run_scar("--source", sc_clean, "--target", os.path.join(tmp, "nope.txt")),
+               "a --target file that is absent stops with its name", exc_type=SystemExit,
+               needle="nope.txt: cannot be read")
+        raises(lambda: run_scar("--source", sc_clean, "--target", tmp),
+               "a --target that is a folder stops, never a traceback", exc_type=SystemExit,
+               needle="cannot be read")
+        check(read_original_fields(put("sc_ok.txt", "A\r\n  b_2  \n#c\n")) == ["A", "b_2"],
+              "read_original_fields trims, skips blank and # lines, and reads CRLF")
+
+        # --- loadscar: the pure parts --------------------------------------------- #
+        cols, hl, rl = dbf_layout(dbf_bytes(SCAR_FIELDS))
+        check(cols == [("PARCEL_NUM", "C", 20, 1), ("NOTES", "C", 254, 21),
+                       ("WHEN_AT", "D", 8, 275), ("AMT", "F", 19, 283), ("CNT", "N", 10, 302)]
+              and hl == 32 + 32 * 5 + 1 and rl == 1 + 20 + 254 + 8 + 19 + 10,
+              "dbf_layout gives each column's offset inside a record, after the flag byte")
+        check(text_cap_hits(b" ab ac a\0 ad", 4, [3, 1]) == [2, 2]
+              and text_cap_hits(b" ab ac a\0 ad", 4, [0]) == [1]
+              and text_cap_hits(b"", 4, [1]) == [0],
+              "text_cap_hits counts records whose byte at a column's end is not blank or NUL")
+        PRO_ORIG = ["PARCEL_NUMBER", "PARCEL_NUMBER_2", "PARCEL_NUMBER_3", "OWNER_NAME",
+                    "OWNER_NAME_FULL", "NOTES", "WHEN_AT", "AMT", "CNT", "BIGN"]
+        PRO_OUT = ["PARCEL_NUM", "PARCEL_N_1", "PARCEL_N_2", "OWNER_NAME", "OWNER_NA_1",
+                   "NOTES", "WHEN_AT", "AMT", "CNT", "BIGN"]
+        check(field_scars(PRO_ORIG, PRO_OUT) == [
+            "field PARCEL_NUMBER was cut to PARCEL_NUM by the 10-character limit",
+            "field PARCEL_NUMBER_2 was cut to PARCEL_N_1 by the 10-character limit",
+            "field PARCEL_NUMBER_3 was cut to PARCEL_N_2 by the 10-character limit",
+            "field OWNER_NAME_FULL was cut to OWNER_NA_1 by the 10-character limit"],
+            "field_scars pairs the names exactly as Pro 3.6 cut and numbered them  "
+            "<-- pinned defect")
+        check(field_scars(PRO_OUT, PRO_OUT) == [] and field_scars(["OBJECTID", "Shape", "A"],
+                                                                  ["a"]) == [],
+              "field_scars finds nothing when every name is there, in any letter case, and "
+              "ignores the managed fields")
+        check(field_scars(["LONG_FIELD_NAME"], ["LONG"]) == [
+            "field LONG_FIELD_NAME has no counterpart in the delivered file"]
+              and field_scars(["ABCDEFGHIJKL"], ["WXYZABC_12"]) == [
+            "field ABCDEFGHIJKL has no counterpart in the delivered file"]
+              and field_scars(["ACRES"], ["ACRES_1234"]) != [],
+              "a name that is not the 10-character form of the original is a lost field")
+        check(field_scars(["ABCDEFGH_XYZ"], ["ABCDEFGH_X", "NEW"]) == [
+            "field ABCDEFGH_XYZ was cut to ABCDEFGH_X by the 10-character limit"],
+              "an extra delivered field is not a scar, and a cut that ends in _X is a cut")
+        check(scar_report([("A", "String")], 3, 3, {}, None) == ([], []),
+              "scar_report: a plain file has no scar and no note")
+        check(scar_report([("A", "String")], None, 3, {}, []) == ([], []),
+              "scar_report: no .shx means no shape count to compare")
+        check(scar_report([("ABCDEFGHIJ", "String"), ("KLMNOPQRST", "String")], 3, 3, {}, None)
+              [1][0].startswith("ABCDEFGHIJ, KLMNOPQRST are exactly 10 characters"),
+              "scar_report: two 10-character names read 'are'")
+        check(scar_report([("A", "Single")], 3, 3, {}, [])[1] == [
+            "A: a null in the original is written as 0 or a sentinel number, and as a space "
+            "in a text field, so a 0 here may be a null"], "a Single gets the null note and no Double note")
+
+        raises(lambda: run_scar("--source", os.path.join(tmp, "absent.shp")),
+               "loadscar on a missing .shp stops with its name", exc_type=SystemExit,
+               needle="absent.shp")
+
         raises(lambda: run_check("--source", os.path.join(tmp, "absent.shp")),
                "a missing .shp stops with its name", exc_type=SystemExit, needle="absent.shp")
         raises(lambda: run_check("--source", put("x.txt", "x")),
@@ -2984,7 +3702,7 @@ def main(argv=None):
         return 0 if check_write(ns.workspace, ns.apply) else 1
 
     return {"import": cmd_import, "chores": cmd_chores, "diff": cmd_diff,
-            "check": cmd_check}[ns.command](ns)
+            "check": cmd_check, "loadscar": cmd_loadscar}[ns.command](ns)
 
 
 if __name__ == "__main__":

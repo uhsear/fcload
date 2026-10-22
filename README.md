@@ -30,6 +30,10 @@ fcload on the same pair, no `--apply`:
       coordinates with the TARGET spatial reference, silently relocating every feature
 ```
 
+Version 1.2.0 adds two more checks of the same kind. `import` now warns when a load drops
+attachments. `loadscar` reads a shapefile that somebody delivered and looks for what the write
+that made it ate. Both are below.
+
 ```
 $ python fcload.py --self-test
 fcload self-test: no arcpy, no geodatabase, no network
@@ -78,6 +82,10 @@ PASS  a .dbf that claims 999 records of 0 bytes is refused: 0 bytes fit any coun
 ...
 PASS  a .dbf or .shp error names the header bytes, never their values  <-- pinned defect
 ...
+PASS  loadscar refuses the prefix --ap of a flag  <-- pinned defect
+...
+PASS  loadscar --check-write gives one error, never the advice to add --apply  <-- pinned defect
+...
 PASS  --check-write without --apply is rejected: the probe is a write  <-- pinned defect
 ...
 PASS  check --check-write gives one error, never the advice to add --apply  <-- pinned defect
@@ -96,6 +104,13 @@ PASS  and Append projects into it on the fly, as in 1.0.0, with no Project first
 PASS  diff --apply without --add-missing never writes either  <-- pinned defect
 ...
 PASS  --check-write alone makes NO arcpy call at all  <-- pinned defect
+...
+PASS  maintainAttachments False warns before the load that the attachments will be dropped  <-- pinned defect
+...
+PASS  a load that drops the attachments says so after, and the row count is still right  <-- pinned defect
+...
+PASS  a relationship class that is not an attachment one is not an attachment  <-- pinned defect
+PASS  the attachment table itself, where the class is the destination, is not given attachments  <-- pinned defect
 ...
 PASS  check refuses a shapefile with no .prj as UNDEFINED  <-- pinned defect
 ...
@@ -124,8 +139,19 @@ PASS  a non-ASCII .prj name is printed escaped on a cp1252 pipe, no crash  <-- p
 ...
 PASS  check refuses a .dbf that claims 0 records over 3, never 'rows: 0' and ACCEPT  <-- pinned defect
 ...
+PASS  a .shx and a .dbf that disagree on the feature count are a scar, exit 2  <-- pinned defect
+PASS  one text value that fills all 254 characters is a scar, singular  <-- pinned defect
+...
+PASS  loadscar refuses a .shx hard linked to a secret and prints no byte of it  <-- pinned defect
+PASS  a full value in a later 4 MiB chunk is counted with one in the first  <-- pinned defect
+...
+PASS  a --target line that is not a field name is refused and never echoed  <-- pinned defect
+PASS  a --target file hard linked to a secret is refused  <-- pinned defect
+...
+PASS  field_scars pairs the names exactly as Pro 3.6 cut and numbered them  <-- pinned defect
+...
 --------------------------------------------------------------------
-463 assertions, 0 failed
+536 assertions, 0 failed
 ```
 
 ## Requirements
@@ -136,6 +162,7 @@ One file, no dependencies, no config file, no credentials. Which modes need arcp
 |---|---|---|
 | `--self-test` | no | any Python 3.9+, Windows or Linux |
 | `check` | no | any Python 3.9+, Windows or Linux |
+| `loadscar` | no | any Python 3.9+, Windows or Linux |
 | `import`, `chores`, `diff` | yes | the ArcGIS Pro interpreter |
 | `--check-write --apply` | yes | the ArcGIS Pro interpreter |
 
@@ -145,8 +172,16 @@ inside `_arcpy()`, which only the geodatabase functions call. A missing arcpy pr
 The self-test asserts that importing `fcload` does not import arcpy, and it runs `check` with
 arcpy made unimportable.
 
-463 assertions pass on Windows (Python 3.13.2). The Python 3.9.25 and Ubuntu 3.12.3 runs predate this change and are not repeated.
-Before this change, the Windows and Ubuntu outputs were identical line for line, apart from Windows line endings.
+536 assertions pass on every host that ran them: Windows on Python 3.13.2, 3.12, 3.10.20 and
+3.9.25, and Ubuntu on Python 3.12.3. The counts are equal because no assertion depends on the
+host. The symbolic link rule is covered by patching `os.path.islink`, and hard links, which need
+no admin rights, are made for real on both. Branch coverage under
+`coverage run --branch fcload.py --self-test` is 100 percent on Windows: 1,881 statements and
+484 branches, none missed. `pyflakes` is clean, and `python -W error` compiles the file on
+both hosts. The shapefiles and geodatabases in the runs below were made by ArcGIS Pro 3.6 on
+Windows. The Ubuntu host has no arcpy, so the geodatabase paths ran there against the stub only.
+On the same Windows-made shapefiles, `loadscar` printed the same lines on Windows and on
+Ubuntu. A `diff` of the two logs was empty.
 
 fcload writes only ASCII to stdout. A `.prj` or `.dbf` can hold any byte, and a Windows pipe or
 log file is cp1252, so a raw CJK name or a C1 byte would crash the run halfway through its
@@ -197,11 +232,255 @@ python fcload.py --self-test
    hard link is refused before it is read. A `.prj` that is not WKT is refused without
    echoing its text, and a header error names the bytes, not their values.
 
+## What it warns about
+
+A warning does not stop the load and does not change the exit code. Each one starts with
+`WARNING`, so a search of the log finds it.
+
+**An import that drops attachments.** A feature class with attachments goes through an
+import, the row count is right, and every attachment is gone. Esri documents the control, the
+geoprocessing environment `maintainAttachments`
+([Maintain Attachments](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/environment-settings/maintain-attachments.html)).
+Its default is True. When it is False, the tools that honor it copy the features and leave
+the attachments behind.
+
+Measured on Pro 3.6, on a file geodatabase feature class with 3 points and 3 attachment rows.
+Each cell is the attachment rows that the target held after one tool ran, in a fresh process:
+
+| Tool | `maintainAttachments` True | `maintainAttachments` False |
+|---|---|---|
+| Feature Class To Feature Class | 3 | no attachment table |
+| Copy Features | 3 | no attachment table |
+| Project | 3 | no attachment table |
+| Append, into a new feature class | 3 | no attachment table |
+| Append, into one with attachments enabled | 3 | 0 |
+
+With the setting False, Feature Class To Feature Class returned `maxSeverity 0`. Its only
+messages were the start time and "Succeeded". A script, or a Pro project, that sets the
+environment to False therefore loses the attachments without a sign.
+
+fcload never sets the environment. It reads `arcpy.env.maintainAttachments`, finds the source's
+attachment table, and says what the load will do. After `--apply` it counts the attachment rows
+in the target. It warns when the count is below the rows the target held before, plus the
+source's rows. These are runs under the Pro interpreter. A wrapper set the environment, then
+called `fcload.main`. Paths are as typed, relative to the run folder.
+With the setting False, a dry run:
+
+```
+fcload import
+  source     : ea.gdb\DS\pts
+  ...
+  target     : ea.gdb\DS -> t2  (WKID 4326)
+  WARNING    : 3 attachment rows in the source will be DROPPED: arcpy.env.maintainAttachments is False, and Pro 3.6 then copies the features at maxSeverity 0 with no warning
+  WARNING    : set arcpy.env.maintainAttachments = True in the session or the project's environment settings, then run fcload again
+  verdict    : ACCEPT
+  ...
+
+  DRY RUN. Nothing was written. Re-run with --apply to load.
+(exit 0)
+```
+
+The same load with `--apply`. The row count is right and the attachment table does not exist:
+
+```
+fcload import
+  source     : ea.gdb\DS\pts
+  ...
+  target     : ea.gdb\DS -> t4  (WKID 4326)
+  WARNING    : 3 attachment rows in the source will be DROPPED: arcpy.env.maintainAttachments is False, and Pro 3.6 then copies the features at maxSeverity 0 with no warning
+  WARNING    : set arcpy.env.maintainAttachments = True in the session or the project's environment settings, then run fcload again
+  verdict    : ACCEPT
+  ...
+  rows: 0 before + 3 loaded = 3 expected, 3 found
+  WARNING    : attachments dropped: the target should hold 3 attachment rows (0 already there + 3 from the source) and holds 0
+  OK: ea.gdb\DS\t4 | Point | SR 'GCS_WGS_1984' (WKID 4326)
+  next: fcload chores --workspace ... --target t4
+(exit 0)
+check by arcpy: attach table exists False None
+```
+
+An append into a target that already held 6 attachment rows, with the setting False:
+
+```
+fcload import
+  source     : ea.gdb\DS\pts
+  ...
+  target     : ea.gdb\DS -> t3  (WKID 4326)
+  WARNING    : 3 attachment rows in the source will be DROPPED: arcpy.env.maintainAttachments is False, and Pro 3.6 then copies the features at maxSeverity 0 with no warning
+  WARNING    : set arcpy.env.maintainAttachments = True in the session or the project's environment settings, then run fcload again
+  verdict    : ACCEPT
+  ...
+  target exists: appending 3 rows with Append (NO_TEST)
+  rows: 6 before + 3 loaded = 9 expected, 9 found
+  WARNING    : attachments dropped: the target should hold 9 attachment rows (6 already there + 3 from the source) and holds 6
+  OK: ea.gdb\DS\t3 | Point | SR 'GCS_WGS_1984' (WKID 4326)
+  next: fcload chores --workspace ... --target t3
+(exit 0)
+check by arcpy: attach table exists True 6
+```
+
+With the setting True, the same loads printed `3 attachment rows now in the target` for a new
+target, and `6 attachment rows now in the target` for the append. `GetCount` on the attachment
+tables gave 3 and 6.
+
+How fcload finds the attachments: a feature class lists its `relationshipClassNames`. The one
+that is an attachment relationship class (`isAttachmentRelationship`, see
+[RelationshipClass properties](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/relationshipclass-properties.html)) and has the feature class as its origin names the
+attachment table as its destination. The public Describe pages that I read do not list
+`relationshipClassNames`. Pro 3.6 ships it in its arcpy type stubs, as "the names of the
+relationship classes that this table participates in". It returned the attachment class in
+every run here. Pro keeps the class and the table of a feature class inside a feature dataset
+at the workspace root, so the search climbs two levels. A shapefile source has no such
+property, and `import` of one printed no attachment line.
+
+## loadscar
+
+A shapefile arrives from someone else. The write that made it has already run, and it left
+little to see. Measured on Pro 3.6: a feature class with ten fields, exported to a shapefile
+with Feature Class To Feature Class and again with Copy Features, gave `maxSeverity 0` and no
+message but the start time and "Succeeded" both times. Both shapefiles held:
+
+- Field names cut to 10 characters. `PARCEL_NUMBER`, `PARCEL_NUMBER_2` and `PARCEL_NUMBER_3`
+  became `PARCEL_NUM`, `PARCEL_N_1` and `PARCEL_N_2`. `OWNER_NAME_FULL` became `OWNER_NA_1`.
+- A 400-character text value, stored as 254 characters.
+- A date with a time of 13:45:10, stored as the day.
+- The Double 1.123456789012345, stored as `1.12345678901e+00`.
+- A null Double and a null Long stored as 0, a null text as spaces, and a null date as blank.
+
+Esri documents these limits: names of at most 10 characters, text fields 254 characters wide,
+dates without a time, and no null values
+([Geoprocessing considerations for shapefile output](https://pro.arcgis.com/en/pro-app/3.5/tool-reference/appendices/geoprocessing-considerations-for-shapefile-output.htm)).
+The page also says that tools which must write a null may write a large sentinel number, and
+that the limit on each shapefile component file is 2 GB.
+
+`loadscar` runs fcload's rules backwards. `check` asks whether a source is safe to load.
+`loadscar` asks what in a delivered file shows that a write lost data. It reads the file with
+the standard library, opens every file read-only, and needs no arcpy.
+
+A scar is evidence. `loadscar` exits 2 and prints REFUSE when it finds one:
+
+1. The `.prj` is missing, is not WKT, is a WKT that Pro reads as `Unknown`, or contradicts the
+   extent. These are rules 1, 3, 4 and 8 of `check`, with the same code.
+2. The `.shx` and the `.dbf` disagree on the number of features. The
+   [shapefile specification](https://www.esri.com/content/dam/esrisites/sitecore-archive/Files/Pdfs/library/whitepapers/pdfs/shapefile.pdf)
+   says the index file is a 100-byte header and one 8-byte record per shape, and that the
+   table must hold one record per shape feature.
+3. A `.dbf` or `.shx` is missing. The specification says a shapefile consists of a main file,
+   an index file and a dBASE table.
+4. A text field 254 characters wide holds a value that fills all 254. That is the most a
+   shapefile text field holds, so a longer original was cut. A value of exactly 254 characters
+   is possible, so this is evidence and not proof.
+5. The file holds no features.
+6. With `--target FIELDS.txt`, a field of the original that was cut to 10 characters, or that
+   has no counterpart in the delivered file. Pairing uses the two forms that Pro 3.6 wrote
+   above: the first 10 characters, and a shorter stem with `_N` that makes 10.
+
+Some losses leave nothing in the file. `loadscar` names them as notes, under the verdict, and
+does not count them as scars: the time of a date, a null written as 0, digits of a Double past
+the twelfth, and a name of exactly 10 characters when no `--target` was given.
+
+`--target FIELDS.txt` is a text file of the original's field names, one per line. A blank line
+and a line that starts with `#` are skipped. Any other line must be letters, digits and
+underscores, starting with a letter. A line that is not is refused and never echoed, because
+the operator may have pointed the flag at a password file. A symbolic link or a file with a
+second hard link is refused for the same reason. The managed fields (`OBJECTID`, `Shape`,
+`GlobalID` and the others in `diff`) are ignored on both sides.
+
+The four shapefiles below were written by Pro 3.6. `tidy.shp` is a clean export. `delivered.shp`
+is the ten-field export above, with the text of its `NOTES` field cut. `lostrow.shp` is that
+file with its second `.dbf` record cut and the header count patched by hand, to stage a loss.
+`noprj.shp` is `delivered.shp` with its `.prj` deleted. `original_fields.txt` is the field list
+that `ListFields` gave for the feature class.
+
+```
+$ python fcload.py loadscar --source tidy.shp
+fcload loadscar (read-only, arcpy is not imported)
+  delivered  : tidy.shp
+  geometry   : Point   rows: 3   fields: 2
+  .prj       : tidy.prj
+  source SR  : 'GCS_WGS_1984' (no WKID stated, Geographic)
+  extent     : (-82.29999999999995, 29.100000000000023, -82.09999999999997, 29.300000000000068)   (.shp header, bytes 36-67)
+  shapes     : 3 in the .shx, 3 in the .dbf
+  verdict    : ACCEPT
+    - no scar found by these rules (see Limitations: absence is not proof)
+  losses that leave no trace (named, not detected):
+    - ACRES: a null in the original is written as 0 or a sentinel number, and as a space in a text field, so a 0 here may be a null
+(exit 0)
+```
+
+The ten-field export, checked against the original's field names:
+
+```
+$ python fcload.py loadscar --source delivered.shp --target original_fields.txt
+fcload loadscar (read-only, arcpy is not imported)
+  delivered  : delivered.shp
+  geometry   : Point   rows: 2   fields: 10
+  .prj       : delivered.prj
+  source SR  : 'GCS_WGS_1984' (no WKID stated, Geographic)
+  extent     : (-82.19999999999999, 29.100000000000023, -82.09999999999997, 29.100000000000023)   (.shp header, bytes 36-67)
+  shapes     : 2 in the .shx, 2 in the .dbf
+  verdict    : REFUSE
+    - 1 value of NOTES fills all 254 characters, the most a shapefile text field holds: a longer original was cut here
+    - field PARCEL_NUMBER was cut to PARCEL_NUM by the 10-character limit
+    - field PARCEL_NUMBER_2 was cut to PARCEL_N_1 by the 10-character limit
+    - field PARCEL_NUMBER_3 was cut to PARCEL_N_2 by the 10-character limit
+    - field OWNER_NAME_FULL was cut to OWNER_NA_1 by the 10-character limit
+  losses that leave no trace (named, not detected):
+    - WHEN_AT: a shapefile date holds the day only, so a time of day in the original is gone and leaves no trace
+    - AMT, CNT, BIGN: a null in the original is written as 0 or a sentinel number, and as a space in a text field, so a 0 here may be a null
+    - a Double is written with 12 significant digits by Pro 3.6, so digits past the twelfth are gone
+(exit 2)
+```
+
+A lost record, then a lost `.prj`. The notes are the same as above and are shortened here:
+
+```
+$ python fcload.py loadscar --source lostrow.shp
+fcload loadscar (read-only, arcpy is not imported)
+  delivered  : lostrow.shp
+  geometry   : Point   rows: 1   fields: 10
+  .prj       : lostrow.prj
+  source SR  : 'GCS_WGS_1984' (no WKID stated, Geographic)
+  extent     : (-82.19999999999999, 29.100000000000023, -82.09999999999997, 29.100000000000023)   (.shp header, bytes 36-67)
+  shapes     : 2 in the .shx, 1 in the .dbf
+  verdict    : REFUSE
+    - the .shx indexes 2 shapes and the .dbf holds 1 record: the two files disagree about how many features the file holds
+    - 1 value of NOTES fills all 254 characters, the most a shapefile text field holds: a longer original was cut here
+  losses that leave no trace (named, not detected):
+    ...
+(exit 2)
+$ python fcload.py loadscar --source noprj.shp
+fcload loadscar (read-only, arcpy is not imported)
+  delivered  : noprj.shp
+  geometry   : Point   rows: 2   fields: 10
+  .prj       : MISSING - the spatial reference is UNDEFINED, never assumed geographic
+  source SR  : 'Unknown' (no WKID stated, type unknown)
+  extent     : (-82.19999999999999, 29.100000000000023, -82.09999999999997, 29.100000000000023)   (.shp header, bytes 36-67)
+  shapes     : 2 in the .shx, 2 in the .dbf
+  verdict    : REFUSE
+    - 1 value of NOTES fills all 254 characters, the most a shapefile text field holds: a longer original was cut here
+    - source spatial reference is UNDEFINED (factoryCode=0, name='Unknown')
+    - arcpy would import this at maxSeverity 0 with no warning and stamp the raw coordinates with the TARGET spatial reference, silently relocating every feature
+    - if you know what the coordinates really are, run `fcload import` with --assume-sr WKID
+  losses that leave no trace (named, not detected):
+    ...
+(exit 2)
+```
+
+`pyogrio.read_info` (GDAL 3.12.4) read `lostrow.shp` as 2 features, and `delivered.shp` with
+the cut names, and printed no complaint.
+
+Four more Pro-made shapefiles covered scars 1, 3 and 5: `tidy.shp` with its `.shx` deleted, with
+its `.dbf` deleted, with a StatePlane feet `.prj` that Pro wrote, and an empty export. Each
+printed REFUSE and exit 2 with the reason for its scar. Windows and Ubuntu printed the same lines.
+
 ## Usage
 
 ```
 python fcload.py check   --source PARCELS.shp
 python fcload.py check   --source PARCELS.shp --target LOADED.shp
+python fcload.py loadscar --source DELIVERED.shp
+python fcload.py loadscar --source DELIVERED.shp --target FIELDS.txt
 python fcload.py import  --source PARCELS.shp --workspace t.gdb --dataset DS
 python fcload.py import  --source PARCELS.shp --workspace t.gdb --dataset DS --apply
 python fcload.py import  --source noprj.shp   --workspace t.gdb --assume-sr 4326 --apply
@@ -601,13 +880,13 @@ listing of the `.gdb` was identical before and after. With `--apply`, the same r
 | Flag | Default | Notes |
 |---|---|---|
 | `--workspace` | required for `import`, `chores`, `diff` | target `.gdb` or `.sde` connection file |
-| `--source` | required for `import`, `diff`, `check` | feature class or shapefile; a `.shp` for `check` |
-| `--target` | required for `chores`, `diff` | feature class name in the workspace; for `check`, an optional second `.shp` |
+| `--source` | required for `import`, `diff`, `check`, `loadscar` | feature class or shapefile; a `.shp` for `check` and `loadscar` |
+| `--target` | required for `chores`, `diff` | feature class name in the workspace; for `check`, an optional second `.shp`; for `loadscar`, an optional text file of the original's field names |
 | `--dataset` | none, workspace root | target feature dataset |
 | `--name` | the source name | output feature class name |
 | `--assume-sr WKID` | unset | `import` only, must be positive |
 | `--add-missing` | off | `diff` only |
-| `--apply` | **off, everything is a dry run** | refused with `check`, which is read-only |
+| `--apply` | **off, everything is a dry run** | refused with `check` and `loadscar`, which are read-only |
 | `--check-write` | off | probe the workspace and stop; needs `--apply` and `import`, `chores` or `diff` |
 | `--self-test` | off | the one flag that takes no subcommand |
 
@@ -615,14 +894,15 @@ listing of the `.gdb` was identical before and after. With `--apply`, the same r
 |---|---|
 | 0 | Accepted, or the dry run or probe succeeded. |
 | 1 | Usage error (argparse's own errors included), a missing or unreadable source or target, a failed load, a failed probe, or a probe table left behind. |
-| 2 | Refused. Nothing was written. |
+| 2 | Refused. Nothing was written. For `loadscar`: a scar was found, or the file is corrupt. |
 
 ## Configuration
 
 None. No config file, no environment variables, no credentials, no hardcoded WKIDs, owners, or
 connection strings. The target WKID is read from the destination feature dataset or the existing
 feature class. The only SR you state by hand is `--assume-sr`, echoed in the verdict so it
-survives in the run's log.
+survives in the run's log. `import` reads one arcpy environment setting, `maintainAttachments`, and
+never sets it.
 
 ## What already exists, and what it does well
 
@@ -640,6 +920,17 @@ empty.shp     crs='EPSG:4326'           bounds=(0.0, 0.0, -1.0, -1.0)      featu
 
 GDAL reports the facts. It does not refuse. `crs=None` next to degree bounds, and a feet
 projection next to degree bounds, are printed without comment. fcload's job is the refusal.
+
+Attachments already have a control in Pro: the `maintainAttachments` setting, above. fcload
+does not replace it. It reads the setting and checks that the load did what the setting says.
+
+For `loadscar`, `gh search repos` on 2026-10-22 found these projects: `ncagle/Shapefile-Validator`
+(a window that checks that a shapefile is valid with geopandas), `codybloemhard/shapefile-linter`
+("linting, cleaning and compression for shapefiles"), `Karthik-Valmiki/GeoLint` and
+`zhangchaosd/dbfview` (a DBF viewer and integrity validator). I did not run them. From their
+descriptions, each checks a file on its own. I found none that compares a delivered file with the
+schema it came from. GDAL, as above, reports `delivered.shp` and `lostrow.shp` as readable files
+and leaves the judgement to the reader.
 
 ## Why the obvious version is wrong
 
@@ -742,6 +1033,37 @@ The second sweep, on Windows, swaps one operator or constant at a time on every 
 Some mutants stop the self-test with an exception instead of a `FAIL` line. That is still
 exit 1.
 
+Version 1.2.0 was checked the same way. Each of these 23 one-line mutations of the new code was
+applied to a copy of `fcload.py` and fails the suite, which has 536 assertions in this build.
+The first failing line and the number of assertions that failed are quoted. The run was on
+Windows, Python 3.13.2.
+
+```
+attachment warning gated on the wrong value   -> FAIL  maintainAttachments False warns before the load that the attachments will be dropped  <-- pinned defect   2 failed
+import ignores the setting                    -> FAIL  maintainAttachments False warns before the load that the attachments will be dropped  <-- pinned defect   1 failed
+post-load count removed                       -> FAIL  a load that copies the attachments counts them after   9 failed
+loss needs one row less                       -> FAIL  a load that copies the attachments counts them after   4 failed
+rows already in the target ignored            -> FAIL  an append that drops them is caught against what was already there   2 failed
+no attachment table is fine                   -> FAIL  attachment_loss: one row short, no table, and a table short of its prior rows are all losses   1 failed
+uncountable table called a success            -> FAIL  an uncountable target table is not called a success   2 failed
+search climbs one level                       -> FAIL  a load that copies the attachments counts them after   5 failed
+any relationship class is an attachment       -> FAIL  a relationship class that is not an attachment one is not an attachment  <-- pinned defect   1 failed
+origin class not checked                      -> FAIL  the attachment table itself, where the class is the destination, is not given attachments  <-- pinned defect   1 failed
+shape count not compared                      -> FAIL  a .shx and a .dbf that disagree on the feature count are a scar, exit 2  <-- pinned defect   3 failed
+NUL counts as a value                         -> FAIL  text_cap_hits counts records whose byte at a column's end is not blank or NUL   1 failed
+a later chunk not counted                     -> FAIL  a full value in a later 4 MiB chunk is counted with one in the first  <-- pinned defect   1 failed
+any 10-character name is a cut                -> FAIL  a name that is not the 10-character form of the original is a lost field   1 failed
+_N form of a cut dropped                      -> FAIL  field_scars pairs the names exactly as Pro 3.6 cut and numbered them  <-- pinned defect   1 failed
+managed fields compared                       -> FAIL  the original's field names find a cut name and a lost field, and the 10-character note gives way to them   2 failed
+missing .dbf or .shx replaces the other scars -> FAIL  a delivery with no .shx is a scar, and its .dbf is still read   1 failed
+empty file judged by its .prj                 -> FAIL  an empty file's extent is not judged against its .prj   1 failed
+.shx size not checked                         -> FAIL  a .shx that is not 100 bytes plus 8 a shape is refused as corrupt   1 failed
+.shx link read                                -> FAIL  loadscar refuses a .shx hard linked to a secret and prints no byte of it  <-- pinned defect   1 failed
+--target link read                            -> FAIL  a --target file hard linked to a secret is refused  <-- pinned defect   1 failed
+--target line echoed                          -> FAIL  a --target line that is not a field name is refused and never echoed  <-- pinned defect   1 failed
+loadscar always exits 0                       -> FAIL  a .shx and a .dbf that disagree on the feature count are a scar, exit 2  <-- pinned defect   15 failed
+```
+
 The subcommands that need a geodatabase run against a recording stub arcpy in the self-test.
 
 ## What it wraps
@@ -749,7 +1071,10 @@ The subcommands that need a geodatabase run against a recording stub arcpy in th
 Everything fcload does to a geodatabase is arcpy: `FeatureClassToFeatureClass`, `Append`,
 `AddField`, `ListFields`, `AddGlobalIDs`, `EnableEditorTracking`, `Describe`, plus
 `CopyFeatures`, `DefineProjection`, `Project`, `GetCount`, `CreateTable` and `Delete`. arcpy does
-all of the work; the only thing claimed as new here is the refusal gate in front of it.
+all of the work. fcload adds the refusal gate in front of it, the attachment warning and
+`loadscar`. The attachment warning also calls `Describe(...).relationshipClassNames`, the
+`isAttachmentRelationship`, `originClassNames` and `destinationClassNames` of a relationship
+class, and `GetCount` on the attachment table.
 
 ## Limitations
 
@@ -817,6 +1142,25 @@ all of the work; the only thing claimed as new here is the refusal gate in front
     keyword. A `GEOGCS` that states a projected code, such as 2237, is reported with that code,
     and `check --target` then prints `matches the target: no reprojection` for a target in 2237.
     `check` also reads a code in non-ASCII digits, such as Arabic-Indic digits, as a number.
+18. The attachment warning was run for real on a file geodatabase only. An enterprise geodatabase
+    was not tried. There the attachment table may sit under a qualified name, and fcload finds it
+    through the relationship class, not by name. The count compares rows, not file contents.
+19. `maintainAttachments` is read from `arcpy.env`. A fresh Pro process printed True. A Pro project
+    can set it to False, and a run from that project then warns. A tool that fcload does not
+    call is out of scope.
+20. A warning exits 0. A scheduled job that must stop on a dropped attachment has to search its
+    log for `WARNING`.
+21. `loadscar` scar 4 is evidence, not proof, and covers only text fields exactly 254 characters
+    wide. It reads the last byte of that field in every record, in 4 MiB chunks. The largest
+    file in the self-test is 20,000 records of 255 bytes. No 2 GB file was timed.
+22. `loadscar` pairs a cut name with its original by the two forms that Pro 3.6 wrote. A writer
+    that cuts or numbers names in another way gets "no counterpart" for each of them, which is
+    true and less helpful. The order of the fields is not compared.
+23. `loadscar` does not read the `.cpg` or the language byte of the `.dbf`. A text value that
+    was written in the wrong code page is not found. It does not read geometry, the offsets in
+    the `.shx`, or the 2 GB size limit of each component file.
+24. `loadscar` compares the `.shx` count with the `.dbf` count. If both files were cut to the same
+    length, scar 2 finds nothing.
 
 ## Contributing
 
