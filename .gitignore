@@ -17,3 +17,6 @@ logs/
 *.env
 credentials*
 *token*
+
+# Coverage data holds local paths
+.coverage
