@@ -139,6 +139,8 @@ PASS  a non-ASCII .prj name is printed escaped on a cp1252 pipe, no crash  <-- p
 ...
 PASS  check refuses a .dbf that claims 0 records over 3, never 'rows: 0' and ACCEPT  <-- pinned defect
 ...
+PASS  check refuses a source with no .dbf, as loadscar does, never ACCEPT on a file it could not read  <-- pinned defect
+...
 PASS  a .shx and a .dbf that disagree on the feature count are a scar, exit 2  <-- pinned defect
 PASS  one text value that fills all 254 characters is a scar, singular  <-- pinned defect
 ...
@@ -147,12 +149,18 @@ PASS  a full value in a later 4 MiB chunk is counted with one in the first  <-- 
 ...
 PASS  a --target line that is not a field name is refused and never echoed  <-- pinned defect
 PASS  a --target file hard linked to a secret is refused  <-- pinned defect
+PASS  a --target file with no field name is refused, never ACCEPT: zero bytes  <-- pinned defect
+PASS  a --target file saved UTF-8 with a BOM is read, not refused as 'not a field name'  <-- pinned defect
+PASS  a hosted layer's Shape__Area and Shape__Length, cut by the writer, are system fields and no scar  <-- pinned defect
 ...
 PASS  field_scars pairs the names exactly as Pro 3.6 cut and numbered them  <-- pinned defect
 ...
 --------------------------------------------------------------------
-536 assertions, 0 failed
+551 assertions, 0 failed
 ```
+
+The block is abridged: each `...` stands for PASS lines left out. Every PASS line quoted appears
+verbatim in the live output, and the footer is the live footer.
 
 ## Requirements
 
@@ -172,12 +180,12 @@ inside `_arcpy()`, which only the geodatabase functions call. A missing arcpy pr
 The self-test asserts that importing `fcload` does not import arcpy, and it runs `check` with
 arcpy made unimportable.
 
-536 assertions pass on every host that ran them: Windows on Python 3.13.2, 3.12, 3.10.20 and
+551 assertions pass on every host that ran them: Windows on Python 3.13.2, 3.12, 3.10.20 and
 3.9.25, and Ubuntu on Python 3.12.3. The counts are equal because no assertion depends on the
 host. The symbolic link rule is covered by patching `os.path.islink`, and hard links, which need
 no admin rights, are made for real on both. Branch coverage under
-`coverage run --branch fcload.py --self-test` is 100 percent on Windows: 1,881 statements and
-484 branches, none missed. `pyflakes` is clean, and `python -W error` compiles the file on
+`coverage run --branch fcload.py --self-test` is 100 percent on Windows: 1,921 statements and
+496 branches, none missed. `pyflakes` is clean, and `python -W error` compiles the file on
 both hosts. The shapefiles and geodatabases in the runs below were made by ArcGIS Pro 3.6 on
 Windows. The Ubuntu host has no arcpy, so the geodatabase paths ran there against the stub only.
 On the same Windows-made shapefiles, `loadscar` printed the same lines on Windows and on
@@ -230,7 +238,9 @@ python fcload.py --self-test
    A `.dbf` whose record length is not the total of its fields, or whose record count does
    not fit its file size, is corrupt too. A `.shp`, `.prj` or `.dbf` that is a symbolic or
    hard link is refused before it is read. A `.prj` that is not WKT is refused without
-   echoing its text, and a header error names the bytes, not their values.
+   echoing its text, and a header error names the bytes, not their values. A source with no
+   `.dbf` is refused too: the specification requires one, and `check` cannot tell what the
+   file holds. `loadscar` refuses the same file, so the two modes agree.
 
 ## What it warns about
 
@@ -384,7 +394,17 @@ and a line that starts with `#` are skipped. Any other line must be letters, dig
 underscores, starting with a letter. A line that is not is refused and never echoed, because
 the operator may have pointed the flag at a password file. A symbolic link or a file with a
 second hard link is refused for the same reason. The managed fields (`OBJECTID`, `Shape`,
-`GlobalID` and the others in `diff`) are ignored on both sides.
+`GlobalID` and the others in `diff`) are ignored on both sides. That includes the hosted-layer
+pair `Shape__Area` and `Shape__Length`, which a shapefile writer cuts to `Shape__Are` and
+`Shape__Len`
+([Esri: ArcGIS Online does not display the Shape Area and Shape Length attributes](https://support.esri.com/en-us/knowledge-base/problem-arcgis-online-does-not-display-the-shape-area-a-000015423)
+names the double-underscore fields).
+
+A file with no field name at all, such as the zero-byte file that a failed `ListFields` export
+leaves, is refused with exit 2. An empty list would compare nothing and print ACCEPT, a cleaner
+verdict than giving no `--target`, and it would switch off the 10-character note. A UTF-8 file
+with a byte order mark and a UTF-16 file with one (Notepad, and Windows PowerShell 5 redirection)
+are read as text.
 
 The four shapefiles below were written by Pro 3.6. `tidy.shp` is a clean export. `delivered.shp`
 is the ten-field export above, with the text of its `NOTES` field cut. `lostrow.shp` is that
@@ -894,7 +914,7 @@ listing of the `.gdb` was identical before and after. With `--apply`, the same r
 |---|---|
 | 0 | Accepted, or the dry run or probe succeeded. |
 | 1 | Usage error (argparse's own errors included), a missing or unreadable source or target, a failed load, a failed probe, or a probe table left behind. |
-| 2 | Refused. Nothing was written. For `loadscar`: a scar was found, or the file is corrupt. |
+| 2 | Refused. Nothing was written. For `loadscar`: a scar was found, the file is corrupt, or the `--target` file has no field name or a line that is not one. A `--target` that is missing or unreadable exits 1. |
 
 ## Configuration
 
@@ -1034,7 +1054,7 @@ Some mutants stop the self-test with an exception instead of a `FAIL` line. That
 exit 1.
 
 Version 1.2.0 was checked the same way. Each of these 23 one-line mutations of the new code was
-applied to a copy of `fcload.py` and fails the suite, which has 536 assertions in this build.
+applied to a copy of `fcload.py` and fails the suite, which had 536 assertions in the build the mutants were run against.
 The first failing line and the number of assertions that failed are quoted. The run was on
 Windows, Python 3.13.2.
 
@@ -1062,6 +1082,17 @@ empty file judged by its .prj                 -> FAIL  an empty file's extent is
 --target link read                            -> FAIL  a --target file hard linked to a secret is refused  <-- pinned defect   1 failed
 --target line echoed                          -> FAIL  a --target line that is not a field name is refused and never echoed  <-- pinned defect   1 failed
 loadscar always exits 0                       -> FAIL  a .shx and a .dbf that disagree on the feature count are a scar, exit 2  <-- pinned defect   15 failed
+```
+
+Four more mutations were applied after the 1.2.0 build, to controls that an operator-flip sweep
+had shown the suite could not fail. Each now fails the suite, which has 551 assertions. The run
+was on Windows, Python 3.13.2.
+
+```
+text-field test `and` flipped to `or`          -> FAIL  a full text field narrower than 254 is not a cut  <-- pinned defect   1 failed
+last-byte offset one byte early                -> FAIL  a 253-character value in a 254-wide field is not a cut: only the last byte counts  <-- pinned defect   1 failed
+attachment baseline `or 0` changed to `or 1`   -> FAIL  an append into a target with no attachment table starts from 0 attachment rows  <-- pinned defect   2 failed
+check reads the .shx by default                -> FAIL  check does not read the .shx, so a corrupt one beside the .shp is not its business  <-- pinned defect   1 failed
 ```
 
 The subcommands that need a geodatabase run against a recording stub arcpy in the self-test.
@@ -1135,7 +1166,8 @@ class, and `GetCount` on the attachment table.
     swapped for a link between them is read.
 15. `check` reads a `.dbf` field length from byte 16 only. Some writers store a text field
     longer than 255 bytes with byte 17 as a high byte. Such a `.dbf` fails the record-length
-    rule and is refused as corrupt.
+    rule and is refused as corrupt. `loadscar` does the same, so a valid delivered file with such
+    a field gets REFUSE for that reason.
 16. `check` reads the first 64 KiB of a `.prj` and ignores the rest. A `.prj` padded past that
     size with whitespace can hide a trailing node that makes Pro read it as `Unknown`.
 17. `check` takes the root `AUTHORITY` code as the WKID without comparing it with the root
@@ -1144,7 +1176,9 @@ class, and `GetCount` on the attachment table.
     `check` also reads a code in non-ASCII digits, such as Arabic-Indic digits, as a number.
 18. The attachment warning was run for real on a file geodatabase only. An enterprise geodatabase
     was not tried. There the attachment table may sit under a qualified name, and fcload finds it
-    through the relationship class, not by name. The count compares rows, not file contents.
+    through the relationship class, not by name. The origin class is matched bare or owner-
+    qualified (`DBO.PTS`), and that match ran against the stub only. The count compares rows,
+    not file contents.
 19. `maintainAttachments` is read from `arcpy.env`. A fresh Pro process printed True. A Pro project
     can set it to False, and a run from that project then warns. A tool that fcload does not
     call is out of scope.
@@ -1161,6 +1195,54 @@ class, and `GetCount` on the attachment table.
     the `.shx`, or the 2 GB size limit of each component file.
 24. `loadscar` compares the `.shx` count with the `.dbf` count. If both files were cut to the same
     length, scar 2 finds nothing.
+25. `loadscar --target` reads UTF-8, with or without a byte order mark, and UTF-16 with one. UTF-16
+    without a byte order mark and other code pages are refused as "not a field name".
+26. After a `WARNING` line the import still ends with `OK:` and exits 0. Treat the load as
+    incomplete when the log holds `WARNING`, whatever the last line says.
+27. With `maintainAttachments` False and an empty source attachment table, the warning says
+    "0 attachment rows ... will be DROPPED", although no row can be lost. The target then has no
+    attachment table, and fcload prints "0 attachment rows now in the target" without naming
+    that loss.
+28. fcload counts every source attachment row as one that should copy. A source with orphaned
+    attachment rows (the parent feature is deleted) can print "attachments dropped" after a
+    correct load.
+29. `import` finds attachments only through `Describe(path).relationshipClassNames` of a
+    geodatabase path. A hosted feature service URL, a map layer name, or a path without that
+    property prints no attachment line. A silent import does not prove the source has none.
+30. When the source count is unknown and the target table is found, `import` prints "N attachment
+    rows now in the target" with no comparison. An uncountable target table counts as 0 before
+    the load, so a real drop can go unreported when the target already held enough rows.
+31. `check` and `loadscar` refuse a `.dbf` with trailing bytes other than one `0x1A` end byte,
+    such as padding that a copy tool added, as truncated or corrupt.
+32. Sibling files are found as all lower-case or all upper-case extensions only. On a
+    case-sensitive filesystem, `Parcels.shp` beside `Parcels.Dbf` is reported as having no
+    `.dbf`, a false scar. Windows is not affected.
+33. `loadscar` counts a deleted `.dbf` record (flag `*`) as a record, and a non-blank last byte in
+    it as a cut value.
+34. `loadscar` reads the first 1 MiB of the `--target` file. A longer list is cut without a
+    message, and a name cut at the boundary can be reported as having no counterpart.
+35. `loadscar --target` echoes any line that looks like a field name. A file that holds one bare
+    token, such as a `.token` file, is printed in "field X has no counterpart". Point it at a
+    field list only.
+36. Esri's Maintain Attachments page lists Append, Copy, Copy Features, Copy Rows, Export
+    Features, Export Table, Merge and Project as the tools that transfer attachments, and says
+    the setting does not create attachments on the output. The measured table above adds Feature
+    Class To Feature Class, which Esri does not list. An Append into a target without
+    attachments carried them across in the Pro 3.6 run, which that page does not predict.
+37. The `loadscar` note "a Double is written with 12 significant digits by Pro 3.6" is also
+    printed for files that other tools (GDAL) wrote, so the writer it names may not have made the
+    file.
+38. The `loadscar` verdict ACCEPT means no scar was found by these rules. The line says that
+    absence is not proof, but the word reads as clean. Do not read it as a clean bill.
+39. `check` refuses GDAL's EPSG:3857 `.prj`, which carries a `Mercator_1SP` projection and
+    `AXIS` and `EXTENSION` nodes. The refusal follows the documented rules, and which node
+    decides it was not isolated. Pro's reading of `EXTENSION` was not verified.
+40. `check` and `loadscar` print the names of a valid WKT `.prj` and the `.dbf` field names as
+    they are. Only a `.prj` that is not WKT is withheld. A credential file would have to parse
+    as WKT to reach the output.
+41. An exception that arcpy raises in `import`, such as a workspace error from the write probe,
+    is printed in arcpy's words. An enterprise connection error can include a server or user
+    name. The text goes to the operator's own log.
 
 ## Contributing
 

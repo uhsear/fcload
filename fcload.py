@@ -130,6 +130,9 @@ SYSTEM_FIELDS = frozenset(
         "OBJECTID", "OID", "FID", "SHAPE", "GEOMETRY", "GLOBALID",
         "SHAPE_LENGTH", "SHAPE_AREA", "SHAPE.LEN", "SHAPE.AREA",
         "SHAPE_LENG", "ST_LENGTH(SHAPE)", "ST_AREA(SHAPE)",
+        # Hosted feature layers carry the double-underscore pair; a shapefile writer cuts
+        # them to 10 characters. Esri technical article 000015423 names the pair.
+        "SHAPE__AREA", "SHAPE__LENGTH", "SHAPE__ARE", "SHAPE__LEN",
     )
 )
 
@@ -1043,14 +1046,21 @@ def scar_report(fields, shapes, rows, full, original):
 
 def read_original_fields(path):
     """The field names in a loadscar --target file: one per line, blank lines and lines
-    that start with # ignored. Raises ValueError for a line that is not a field name, and
-    does not echo it: the operator may have pointed this at a password file."""
+    that start with # ignored. A UTF-8 or UTF-16 byte order mark is read as one (Notepad and
+    Windows PowerShell 5 write them). Raises ValueError for a line that is not a field
+    name, and does not echo it: the operator may have pointed this at a password file.
+    Raises ValueError too when the file holds no name at all: a failed export leaves an
+    empty file, and an empty list would compare nothing and read as clean."""
     try:
         if os.path.isfile(path):
             _refuse_link(path)
-        text = _read(path, 1 << 20).decode("utf-8", "replace")
+        raw = _read(path, 1 << 20)
     except OSError as exc:
         raise SystemExit("--target %s: cannot be read: %s" % (path, exc))
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16", "replace")
+    else:
+        text = raw.decode("utf-8-sig", "replace")
     names = []
     for number, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -1061,6 +1071,9 @@ def read_original_fields(path):
                              "digits and underscores, starting with a letter): not echoed"
                              % (path, number))
         names.append(line)
+    if not names:
+        raise ValueError("--target %s: holds no field name, so nothing would be compared "
+                         "(an empty file is what a failed field export leaves)" % path)
     return names
 
 
@@ -1265,6 +1278,11 @@ def cmd_check(ns):
                                             if src["shape_type"] == 0 else
                                             "the .dbf holds 0 records"))
         return 2
+    if src["dbf"] is None:
+        print("  verdict    : REFUSE")
+        print("    - no .dbf beside the .shp: the shapefile specification requires it, so "
+              "the check cannot tell what the file holds")
+        return 2
 
     target_wkid = None
     if tgt:
@@ -1390,6 +1408,12 @@ def attachment_rows(arcpy, path):
     search climbs from the path to its two nearest parents.
     """
     base = os.path.basename(path).lower()
+
+    def is_origin(name):
+        # An enterprise geodatabase may report the owner-qualified name (DBO.PTS).
+        name = name.lower()
+        return name == base or name.endswith("." + base) or base.endswith("." + name)
+
     here = path
     for rel in getattr(arcpy.Describe(path), "relationshipClassNames", None) or []:
         for _ in range(2):
@@ -1399,7 +1423,7 @@ def attachment_rows(arcpy, path):
                 continue
             rd = arcpy.Describe(rel_path)
             if (getattr(rd, "isAttachmentRelationship", False)
-                    and base in [n.lower() for n in rd.originClassNames]):
+                    and any(is_origin(n) for n in rd.originClassNames)):
                 table = os.path.join(here, rd.destinationClassNames[0])
                 return (int(arcpy.management.GetCount(table)[0]) if arcpy.Exists(table)
                         else UNKNOWN_ROWS)
@@ -3142,6 +3166,23 @@ def self_test():
     check("attachment" not in out,
           "a relationship class that is not an attachment one is not an attachment  "
           "<-- pinned defect")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, dest_exists=True,
+                        dest_before=5)
+    check(rc == 0 and "3 attachment rows now in the target" in out and "WARNING" not in out,
+          "an append into a target with no attachment table starts from 0 attachment rows  "
+          "<-- pinned defect")
+    rc, out, stub = run(cmd_import, IMPORT + ["--apply"], src_attach=3, dest_exists=True,
+                        dest_before=5, attach_copies=False)
+    check("(0 already there + 3 from the source) and holds 0" in out,
+          "and the baseline in the message is 0, not a guess  <-- pinned defect")
+    for label, origin in (("owner-qualified", "DBO.SRC.SHP"), ("database-qualified",
+                                                                "db.dbo.src.shp")):
+        rc, out, stub = run(cmd_import, IMPORT, src_attach=3, rel_origin=origin)
+        check("3 attachment rows in the source" in out,
+              "an origin class reported %s still finds the attachments  <-- pinned defect"
+              % label)
+    rc, out, stub = run(cmd_import, IMPORT, src_attach=3, rel_origin="XSRC.SHP")
+    check("attachment" not in out, "a name that only ends the same way is not the origin")
     rc, out, stub = run(cmd_import, IMPORT, src_attach=3, rel_origin="some_other_class")
     check("attachment" not in out,
           "the attachment table itself, where the class is the destination, is not "
@@ -3278,8 +3319,8 @@ def self_test():
             "tgt_nulls", prj=SPF, shape_type=0, bbox=(0.0, 0.0, 0.0, 0.0)))
         check(rc == 0, "nor is the bbox of a target of Null shapes")
         rc, out = run_check("--source", shapefile("nodbf_src", fields=None), "--target", wgs)
-        check("not compared, a .dbf is missing" in out and "missing in source" not in out,
-              "a source with no .dbf is not diffed as if it had no fields")
+        check(rc == 2 and "no .dbf beside the .shp" in out and "missing in source" not in out,
+              "a source with no .dbf is refused, not diffed as if it had no fields")
         vcs = shapefile("vcs", prj=PRO_VCS, bbox=SP_FEET)
         rc, out = run_check("--source", vcs)
         check(rc == 0 and "verdict    : ACCEPT" in out,
@@ -3318,8 +3359,10 @@ def self_test():
         check("not compared, a .dbf is missing" in out,
               "fields are not compared when a .dbf is missing")
         rc, out = run_check("--source", shapefile("nodbf", fields=None))
-        check(rc == 0 and "rows: unknown (no .dbf)" in out,
-              "a source with no .dbf is still checked, its rows reported unknown")
+        check(rc == 2 and "rows: unknown (no .dbf)" in out and "verdict    : REFUSE" in out
+              and "ACCEPT" not in out,
+              "check refuses a source with no .dbf, as loadscar does, never ACCEPT on a file "
+              "it could not read  <-- pinned defect")
 
         up = shapefile("upper", prj=None)
         put("upper.PRJ", WGS84)
@@ -3433,6 +3476,12 @@ def self_test():
         rc, out = run_check("--source", shapefile("bigdbf", fields=None))
         check(rc == 0 and "rows: 3200" in out,
               "a .dbf larger than the 64 KiB header read is sized from the file, not the read")
+        shapefile("cshx")
+        put("cshx.shx", shp_bytes(records=3, record_size=8) + b"\0\0\0")
+        rc, out = run_check("--source", os.path.join(tmp, "cshx.shp"))
+        check(rc == 0 and ".shx" not in out,
+              "check does not read the .shx, so a corrupt one beside the .shp is not its "
+              "business  <-- pinned defect")
         rc, out = run_check("--source", wgs, "--target", shapefile("tgtbad", code=1))
         check(rc == 2 and "target" in out and "tgtbad.shp" in out,
               "a corrupt target is refused and named as the target")
@@ -3593,6 +3642,15 @@ def self_test():
             globals()["scan_text_caps"] = real_scan
         rc, out = run_scar("--source", delivered("sc_nowide", fields=SCAR_FIELDS[:1]))
         check(rc == 0, "a .dbf with no 254-character text field is not scanned at all")
+        rc, out = run_scar("--source", delivered("sc_narrow", fields=[("NOTES", "C", 50, 0)],
+                                                  values=[[b"x" * 50]] * 3))
+        check(rc == 0 and "fill" not in out,
+              "a full text field narrower than 254 is not a cut  <-- pinned defect")
+        rc, out = run_scar("--source", delivered("sc_v253", fields=[("NOTES", "C", 254, 0)],
+                                                  values=[[b"x" * 253]] * 3))
+        check(rc == 0 and "fill" not in out,
+              "a 253-character value in a 254-wide field is not a cut: only the last byte "
+              "counts  <-- pinned defect")
 
         # --- loadscar: the --target file of original names ----------------------- #
         rc, out = run_scar("--source", sc_clean, "--target", put("sc_bad.txt", "NOTES\nhost:5432:"
@@ -3613,6 +3671,36 @@ def self_test():
                needle="cannot be read")
         check(read_original_fields(put("sc_ok.txt", "A\r\n  b_2  \n#c\n")) == ["A", "b_2"],
               "read_original_fields trims, skips blank and # lines, and reads CRLF")
+        for label, body in (("zero bytes", ""), ("only comments and blanks", "# none\n\n  \n")):
+            rc, out = run_scar("--source", sc_clean, "--target", put("sc_none.txt", body))
+            check(rc == 2 and "verdict    : REFUSE" in out and "holds no field name" in out
+                  and "ACCEPT" not in out,
+                  "a --target file with no field name is refused, never ACCEPT: %s  "
+                  "<-- pinned defect" % label)
+        for label, enc in (("UTF-8 with a BOM", b"\xef\xbb\xbf"),
+                           ("UTF-16 LE with a BOM", b"\xff\xfe"),
+                           ("UTF-16 BE with a BOM", b"\xfe\xff")):
+            text = u"PARCEL_NUMBER\r\nNOTES\r\n"
+            body = enc + (text.encode("utf-8") if enc[:1] == b"\xef" else text.encode(
+                "utf-16-le" if enc[:1] == b"\xff" else "utf-16-be"))
+            rc, out = run_scar("--source", sc_clean, "--target", put("sc_bom.txt", body))
+            check(rc == 2 and "field PARCEL_NUMBER was cut to PARCEL_NUM" in out
+                  and "is not a field name" not in out,
+                  "a --target file saved %s is read, not refused as 'not a field name'  "
+                  "<-- pinned defect" % label)
+        rc, out = run_scar(
+            "--source", delivered("sc_hosted", fields=[("FID", "N", 10, 0), ("PIN", "C", 20, 0),
+                                                       ("Shape__Are", "F", 19, 11),
+                                                       ("Shape__Len", "F", 19, 11)],
+                                  values=[[b"1", b"A", b"1.5", b"2.5"]] * 3),
+            "--target", put("sc_hosted.txt", "OBJECTID\nPIN\nShape__Area\nShape__Length\n"
+                                             "GlobalID\n"))
+        check(rc == 0 and "cut to" not in out,
+              "a hosted layer's Shape__Area and Shape__Length, cut by the writer, are system "
+              "fields and no scar  <-- pinned defect")
+        check(field_scars(["Shape__Area", "Shape__Length"], []) == []
+              and field_diff([("Shape__Area", "Double")], []) == ([], [], []),
+              "the double-underscore system fields are ignored by field_scars and by diff")
 
         # --- loadscar: the pure parts --------------------------------------------- #
         cols, hl, rl = dbf_layout(dbf_bytes(SCAR_FIELDS))
